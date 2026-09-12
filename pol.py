@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pollistan Auto-Redeemer — Firebase OTP + Parallel Workers + Flask Server + Telegram Notification
+Pollistan Auto-Redeemer — Firebase OTP + Parallel Workers + Flask Server + Telegram Commands
 """
 
 import requests
@@ -19,11 +19,10 @@ from datetime import datetime
 from flask import Flask
 
 # ─────────────────────────────────────────────
-# TELEGRAM BOT CONFIG
+# TELEGRAM BOT CONFIG & COMMAND HANDLER
 # ─────────────────────────────────────────────
 BOT_TOKEN = "8876082662:AAG5mw5h8Pim7V236Xnk0MJt-lEv_RWOuAU"
-# Apni Chat ID ya Channel ID yahan daalein (e.g. 123456789 ya "@yourchannel")
-CHAT_ID   = ""  
+CHAT_ID   = ""  # Mandatory: Apni Numeric Chat ID daalein (e.g. 123456789)
 
 def send_telegram_message(message):
     """Send text notification to Telegram bot/channel."""
@@ -39,6 +38,62 @@ def send_telegram_message(message):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         log(f"  [ERR] Telegram send failed: {e}")
+
+def telegram_bot_listener():
+    """Poll Telegram updates for /add command to dynamically insert Firebase links."""
+    offset = 0
+    log("  [TELEGRAM] Command Listener Active (/add <url>)")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            resp = requests.get(url, timeout=25)
+            if resp.status_code == 200:
+                updates = resp.json().get("result", [])
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip()
+                    chat = message.get("chat", {})
+                    sender_chat_id = str(chat.get("id", ""))
+
+                    # Ignore messages from unauthorized chats if CHAT_ID is configured
+                    if CHAT_ID and sender_chat_id != str(CHAT_ID):
+                        continue
+
+                    if text.startswith("/add"):
+                        parts = text.split(maxsplit=1)
+                        if len(parts) > 1:
+                            new_link = parts[1].strip()
+                            parsed_url = parse_firebase_link(new_link)
+                            
+                            if parsed_url or "firebase" in new_link:
+                                save_url = parsed_url if parsed_url else new_link
+                                with open(FIREBASE_FILE, "a", encoding="utf-8") as f:
+                                    f.write(f"\n{save_url}")
+                                
+                                response_text = (
+                                    f"✅ <b>Firebase Link Added Successfully!</b>\n\n"
+                                    f"🔗 <code>{save_url}</code>\n\n"
+                                    f"⚙️ Starting Automation Worker..."
+                                )
+                                send_telegram_message(response_text)
+                                
+                                # Trigger background processing
+                                threading.Thread(target=run_automation, daemon=True).start()
+                            else:
+                                send_telegram_message("❌ <b>Invalid Firebase URL format.</b>")
+                        else:
+                            send_telegram_message("⚠️ <b>Usage:</b> <code>/add <firebase_url></code>")
+                    
+                    elif text == "/start" or text == "/help":
+                        send_telegram_message(
+                            "🤖 <b>Pollistan Bot Controller</b>\n\n"
+                            "Commands:\n"
+                            "• <code>/add &lt;firebase_url&gt;</code> - Firebase Link save karke bot start karein."
+                        )
+        except Exception as e:
+            time.sleep(5)
+        time.sleep(2)
 
 # ─────────────────────────────────────────────
 # FLASK WEB SERVER (FOR RENDER DEPLOYMENT)
@@ -480,11 +535,9 @@ def process_number(phone, firebase_url, client_id):
 def run_automation():
     workers = DEFAULT_WORKERS
 
-    if not os.path.exists(FIREBASE_FILE):
-        print(f"[ERROR] {FIREBASE_FILE} not found!")
-        return
-
+    # Create files if missing to avoid crashes
     for fpath, header in [
+        (FIREBASE_FILE, "# Firebase URLs List\n"),
         (VOUCHER_FILE, "# phone | voucherCode | voucherPin | amount\n\n"),
         (FAILED_FILE,  "# phone | reason\n\n"),
     ]:
@@ -512,7 +565,7 @@ def run_automation():
             panel_urls.append(url)
 
     if not panel_urls:
-        print("[ERROR] No valid Firebase URLs.")
+        print("[WARN] No Firebase URLs found in l.txt yet. Send /add <url> via Telegram.")
         return
 
     print(f"\nScanning {len(panel_urls)} Firebase panels...")
@@ -563,9 +616,16 @@ def run_automation():
     print(f"{'='*55}")
 
 if __name__ == "__main__":
+    # Start Telegram Listener in background thread
+    tg_thread = threading.Thread(target=telegram_bot_listener)
+    tg_thread.daemon = True
+    tg_thread.start()
+
+    # Start Automation Worker thread
     task_thread = threading.Thread(target=run_automation)
     task_thread.daemon = True
     task_thread.start()
 
+    # Run Flask Web Server
     run_flask()
 
