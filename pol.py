@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pollistan Auto-Redeemer — Firebase OTP + Parallel Workers + Flask Server
+Pollistan Auto-Redeemer — Firebase OTP + Parallel Workers + Flask Server + Telegram Notification
 """
 
 import requests
@@ -19,6 +19,28 @@ from datetime import datetime
 from flask import Flask
 
 # ─────────────────────────────────────────────
+# TELEGRAM BOT CONFIG
+# ─────────────────────────────────────────────
+BOT_TOKEN = "8876082662:AAG5mw5h8Pim7V236Xnk0MJt-lEv_RWOuAU"
+# Apni Chat ID ya Channel ID yahan daalein (e.g. 123456789 ya "@yourchannel")
+CHAT_ID   = ""  
+
+def send_telegram_message(message):
+    """Send text notification to Telegram bot/channel."""
+    if not CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log(f"  [ERR] Telegram send failed: {e}")
+
+# ─────────────────────────────────────────────
 # FLASK WEB SERVER (FOR RENDER DEPLOYMENT)
 # ─────────────────────────────────────────────
 app = Flask(__name__)
@@ -32,7 +54,6 @@ def health():
     return "OK", 200
 
 def run_flask():
-    # Render environments assign port dynamically via PORT env variable
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
@@ -374,13 +395,14 @@ def get_amazon_voucher(session, verify_response):
     return None, None, 0
 
 # ─────────────────────────────────────────────
-# SAVE
+# SAVE & NOTIFY
 # ─────────────────────────────────────────────
 def save_voucher(phone, code, pin, amount):
     line = f"{phone} | {code} | {pin} | ₹{amount}\n"
     with voucher_lock:
         with open(VOUCHER_FILE, "a", encoding="utf-8") as f:
             f.write(line)
+            
     log(f"\n{'='*55}")
     log(f"  🎁  VOUCHER!")
     log(f"  📱  Phone   : {phone}")
@@ -388,6 +410,16 @@ def save_voucher(phone, code, pin, amount):
     log(f"  🔑  PIN     : {pin}")
     log(f"  💰  Amount  : ₹{amount}")
     log(f"{'='*55}\n")
+
+    # Telegram Notification Format
+    tg_text = (
+        f"<b>🎁 New Voucher Redeemed!</b>\n\n"
+        f"📱 <b>Phone:</b> <code>{phone}</code>\n"
+        f"🎫 <b>Code:</b> <code>{code}</code>\n"
+        f"🔑 <b>PIN:</b> <code>{pin}</code>\n"
+        f"💰 <b>Amount:</b> ₹{amount}"
+    )
+    send_telegram_message(tg_text)
 
 def save_failed(phone, reason):
     with failed_lock:
@@ -531,11 +563,9 @@ def run_automation():
     print(f"{'='*55}")
 
 if __name__ == "__main__":
-    # Start the automation script in a background thread
     task_thread = threading.Thread(target=run_automation)
     task_thread.daemon = True
     task_thread.start()
 
-    # Start Flask Web Server on Main Thread for Render
     run_flask()
 
