@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enhanced multi-user Telegram bot hosting panel (powerful build — UNLIMITED).
+"""Enhanced multi-user Telegram bot hosting panel — reply-keyboard build.
 
 Run: export BOT_TOKEN='123:abc'; python hosting_powerful.py
 """
@@ -32,23 +32,33 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is required.")
+
+PARTY_EFFECT_ID = "5046509860389126442"
+
 DATA_DIR = Path(os.getenv("HOSTING_DATA_DIR", "data")).resolve()
 PROJECTS_DIR = Path(os.getenv("HOSTING_PROJECTS_DIR", "hosted_bots")).resolve()
 DB_FILE = DATA_DIR / "hosting_db.json"
 KEY_FILE = DATA_DIR / "master.key"
 
-# ── Unlimited-ish caps ─────────────────────────────────────────────────────
-MAX_UPLOAD        = 10 * 1024**4        # 10 TB (practical: Telegram's own limit)
-MAX_EXTRACTED     = 10 * 1024**4        # 10 TB
-MAX_FILES         = 10_000_000
-MAX_SINGLE_FILE   = 10 * 1024**4        # 10 TB
+_MAX_MB = int(os.getenv("MAX_UPLOAD_MB", "75"))
+MAX_UPLOAD        = _MAX_MB * 1024 * 1024
+MAX_EXTRACTED     = _MAX_MB * 1024 * 1024
+MAX_FILES         = 500
+MAX_SINGLE_FILE   = _MAX_MB * 1024 * 1024
 MAX_BOTS_PER_USER = int(os.getenv("MAX_BOTS_PER_USER", "1000000"))
-MAX_LOG_BYTES     = 1024 * 1024 * 1024  # 1 GB before rotation
-MAX_BACKUP_MEM    = 2 * 1024**3         # 2 GB — safe in-memory ZIP cap
-MAX_BOT_RAM_MB    = int(os.getenv("MAX_BOT_RAM_MB", "0"))   # 0 = unlimited
-MAX_BOT_CPU_PCT   = int(os.getenv("MAX_BOT_CPU_PCT", "0"))  # 0 = unlimited
+MAX_LOG_BYTES     = 1024 * 1024 * 1024
+MAX_BACKUP_MEM    = 2 * 1024**3
+MAX_BOT_RAM_MB    = int(os.getenv("MAX_BOT_RAM_MB", "0"))
+MAX_BOT_CPU_PCT   = int(os.getenv("MAX_BOT_CPU_PCT", "0"))
+# 🆕 PATCH 4a: Per-bot disk quota
+MAX_BOT_DISK_MB   = int(os.getenv("MAX_BOT_DISK_MB", "500"))
 RESOURCE_CHECK_INTERVAL = 5
 BLOCKED_ENV = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONHOME", "VIRTUAL_ENV"}
+# 🆕 PATCH 7a: Auto-backup config
+BACKUP_CHANNEL = os.getenv("BACKUP_CHANNEL", "").strip()
+BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", "24"))
+
+_TOKEN_PATTERN = re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{33,}\b")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,6 +74,13 @@ RETRY_AT: dict[str, float] = {}
 STATES: dict[int, dict[str, Any]] = {}
 LAST_ACTION: dict[int, float] = {}
 _CPU_SAMPLES: dict[str, tuple[float, float]] = {}
+
+MENU_LEVEL: dict[int, str] = {}
+SELECTED_BOT: dict[int, str] = {}
+BOT_INDEX: dict[int, list[str]] = {}
+# 🆕 PATCH 6a: Live log streaming state
+LIVE_LOGS_ACTIVE: dict[str, int] = {}
+LIVE_LOGS_STOP: dict[str, threading.Event] = {}
 
 # ── Crypto + DB ────────────────────────────────────────────────────────────
 def _load_key() -> bytes:
@@ -212,6 +229,49 @@ def detect_entry(root: Path) -> str:
     cands = sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in {".py", ".js", ".mjs", ".cjs"})
     return cands[0].name if cands else "main.py"
 
+def _scan_hardcoded_token(bot_id: str) -> Optional[str]:
+    try:
+        root = project_dir(bot_id)
+        for src_file in root.rglob("*"):
+            if not src_file.is_file() or src_file.is_symlink():
+                continue
+            if src_file.suffix.lower() not in {".py", ".js", ".mjs", ".cjs"}:
+                continue
+            if any(part in {".venv", "__pycache__", "node_modules"} for part in src_file.parts):
+                continue
+            try:
+                content = src_file.read_text(errors="ignore")
+            except Exception:
+                continue
+            m = _TOKEN_PATTERN.search(content)
+            if m:
+                return m.group(0)
+        return None
+    except Exception:
+        return None
+
+
+# 🆕 PATCH 2a: Duplicate token detection
+def _find_duplicate_token(uid: int, current_bot_id: str, token: str) -> Optional[str]:
+    if not token or len(token) < 20:
+        return None
+    for b in user_bots(uid):
+        if b["id"] == current_bot_id:
+            continue
+        envs = decrypt_obj(b.get("env_enc", ""))
+        if envs.get("BOT_TOKEN", "") == token:
+            return b["id"]
+    return None
+
+
+def _extract_env_token(bot_id: str) -> str:
+    b = get_bot(bot_id)
+    if not b:
+        return ""
+    envs = decrypt_obj(b.get("env_enc", ""))
+    return envs.get("BOT_TOKEN", "").strip()
+
+
 # ── Record + log helpers ───────────────────────────────────────────────────
 def _create_record(uid: int, name: str, source: str = "upload") -> dict[str, Any]:
     if len(user_bots(uid)) >= MAX_BOTS_PER_USER:
@@ -226,6 +286,12 @@ def _create_record(uid: int, name: str, source: str = "upload") -> dict[str, Any
         "auto_restart": True, "restart_interval": 0, "last_interval_restart": now,
         "restart_count": 0, "env_enc": "", "last_exit": None,
         "deps_signature": "", "resource_killed": False,
+        "daily_restart": "",
+        "last_daily_restart": 0,
+        # 🆕 PATCH 1a: Crash loop protection fields
+        "recent_crashes": [],
+        "failed_state": False,
+        "failed_reason": "",
     }
     data = db_load()
     data["bots"][bot_id] = rec
@@ -265,7 +331,7 @@ def tail_logs(bot_id: str, lines: int = 500) -> str:
     except Exception as exc:
         return f"Read error: {exc}"
 
-# ── Auto-pip: import scan + PYPI mapping ──────────────────────────────────
+# ── Auto-pip ──────────────────────────────────────────────────────────────
 _IMPORT_PYPI = {
     "telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot",
     "aiogram": "aiogram", "pyrogram": "pyrogram", "telethon": "telethon",
@@ -281,6 +347,7 @@ _IMPORT_PYPI = {
     "flask": "flask", "fastapi": "fastapi", "psutil": "psutil",
     "redis": "redis", "motor": "motor", "pymongo": "pymongo",
     "numpy": "numpy", "pandas": "pandas", "matplotlib": "matplotlib",
+    "firebase_admin": "firebase-admin",
 }
 
 def scan_imports(root: Path) -> set[str]:
@@ -323,7 +390,6 @@ def missing_imports(root: Path, venv_py: Path) -> list[str]:
             missing.append(_IMPORT_PYPI.get(imp, imp))
     return missing
 
-# ── Env build ──────────────────────────────────────────────────────────────
 def _base_child_env(bot: dict[str, Any]) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items()
            if k in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"}}
@@ -337,7 +403,6 @@ def _base_child_env(bot: dict[str, Any]) -> dict[str, str]:
 def _venv_python(root: Path) -> Path:
     return root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
-# ── Dependency install (with cache + auto-pip) ────────────────────────────
 def ensure_venv(bot_id: str, timeout: int = 3600) -> tuple[bool, str]:
     root = project_dir(bot_id)
     py = _venv_python(root)
@@ -353,7 +418,6 @@ def ensure_venv(bot_id: str, timeout: int = 3600) -> tuple[bool, str]:
         return False, str(exc)
 
 def _deps_signature(root: Path) -> str:
-    """Hash of requirements.txt + sorted import list, used to skip pip installs."""
     import hashlib
     h = hashlib.sha256()
     req = root / "requirements.txt"
@@ -373,7 +437,6 @@ def install_requirements(bot_id: str, packages: Optional[list[str]] = None) -> t
     py = _venv_python(root)
     bot = get_bot(bot_id) or {}
 
-    # Cache: skip pip when nothing changed (only for auto installs)
     sig = _deps_signature(root)
     if not packages and bot.get("deps_signature") == sig:
         return True, "Dependencies cached"
@@ -397,7 +460,6 @@ def install_requirements(bot_id: str, packages: Optional[list[str]] = None) -> t
         except Exception as exc:
             return False, str(exc)
 
-    # Step 1: requirements.txt if present
     req = root / "requirements.txt"
     if req.is_file():
         try:
@@ -411,7 +473,6 @@ def install_requirements(bot_id: str, packages: Optional[list[str]] = None) -> t
         except Exception as exc:
             return False, str(exc)
 
-    # Step 2: auto-detect missing imports
     try:
         miss = missing_imports(root, py)
         if miss:
@@ -450,7 +511,6 @@ def install_node_requirements(bot_id: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
 
-# ── Process build / lifecycle ─────────────────────────────────────────────
 def _command_for(bot: dict[str, Any]) -> list[str]:
     root = project_dir(bot["id"])
     entry = safe_project_path(root, bot.get("entry", "main.py"))
@@ -514,6 +574,17 @@ def start_process(bot_id: str, manual: bool = True) -> tuple[bool, str]:
         if ex and ex.get("proc") and ex["proc"].poll() is None:
             return True, "Already running"
     try:
+        # 🆕 PATCH 2c: Duplicate token check before start
+        my_token = _extract_env_token(bot_id)
+        if my_token:
+            dup = _find_duplicate_token(bot["owner"], bot_id, my_token)
+            if dup:
+                dup_bot = get_bot(dup)
+                return False, (
+                    f"Duplicate BOT_TOKEN — same as '{dup_bot['name'] if dup_bot else dup}'\n"
+                    f"Use different token or stop the other bot first."
+                )
+
         ext = Path(bot.get("entry", "main.py")).suffix.lower()
         if ext == ".py":
             ok, msg = install_requirements(bot_id)
@@ -552,7 +623,6 @@ def restart_process(bot_id: str) -> tuple[bool, str]:
     time.sleep(0.3)
     return start_process(bot_id)
 
-# ── File helpers ──────────────────────────────────────────────────────────
 def project_files(bot_id: str) -> list[Path]:
     root = project_dir(bot_id)
     skip = {".venv", ".git", "__pycache__"}
@@ -585,6 +655,7 @@ def make_backup(bot_id: str) -> bytes:
             "env": decrypt_obj(bot.get("env_enc", "")),
             "restart_interval": bot.get("restart_interval", 0),
             "auto_restart": bot.get("auto_restart", True),
+            "daily_restart": bot.get("daily_restart", ""),
         }
         zf.writestr("bot_meta.json", json.dumps(meta, indent=2))
     return buf.getvalue()
@@ -621,6 +692,8 @@ def restore_backup(bot_id: str, raw: bytes) -> int:
                     changes["restart_interval"] = max(0, meta["restart_interval"])
                 if isinstance(meta.get("auto_restart"), bool):
                     changes["auto_restart"] = meta["auto_restart"]
+                if isinstance(meta.get("daily_restart"), str):
+                    changes["daily_restart"] = meta["daily_restart"]
                 meta_path.unlink()
             except Exception:
                 pass
@@ -649,14 +722,15 @@ def clone_bot(uid: int, bot_id: str) -> Optional[dict[str, Any]]:
         "id": new_id, "name": (b["name"] + " (copy)")[:200],
         "created": now, "desired_running": False,
         "restart_count": 0, "last_interval_restart": now,
+        "last_daily_restart": 0,
         "deps_signature": "",
+        "recent_crashes": [], "failed_state": False, "failed_reason": "",
     }
     data = db_load()
     data["bots"][new_id] = new_rec
     db_save(data)
     return new_rec
 
-# ── GitHub ─────────────────────────────────────────────────────────────────
 def clone_public_github(url: str, dest: Path, token: Optional[str] = None) -> tuple[bool, str]:
     m = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?", url.strip())
     if not m:
@@ -677,7 +751,6 @@ def clone_public_github(url: str, dest: Path, token: Optional[str] = None) -> tu
     except Exception as exc:
         return False, str(exc)
 
-# ── Status helpers ─────────────────────────────────────────────────────────
 def _format_bytes(n: float) -> str:
     x = float(max(0, n))
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -686,8 +759,131 @@ def _format_bytes(n: float) -> str:
         x /= 1024
     return f"{x:.1f} TB"
 
+# 🆕 PATCH 4b: Disk usage helper
+def _bot_disk_usage_mb(bot_id: str) -> float:
+    try:
+        root = project_dir(bot_id)
+        if not root.exists():
+            return 0.0
+        total = 0
+        for p in root.rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        return total / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
 def esc(v: Any) -> str:
     return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+# 🆕 PATCH 7b: Auto-backup functions
+def _do_auto_backup() -> None:
+    if not BACKUP_CHANNEL:
+        return
+    try:
+        target = DATA_DIR / f"panel_backup_{int(time.time())}.zip"
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+            if DB_FILE.exists():
+                zf.write(DB_FILE, arcname="hosting_db.json")
+            if KEY_FILE.exists():
+                zf.write(KEY_FILE, arcname="master.key")
+            for bid, b in db_load().get("bots", {}).items():
+                meta = {
+                    "id": bid, "name": b.get("name"), "entry": b.get("entry"),
+                    "env": decrypt_obj(b.get("env_enc", "")),
+                    "created": b.get("created"),
+                }
+                zf.writestr(f"bots/{bid}/meta.json", json.dumps(meta, indent=2))
+        size = target.stat().st_size
+        with target.open("rb") as fh:
+            bot.send_document(
+                BACKUP_CHANNEL, fh,
+                caption=f"💾 <b>Panel Backup</b>\nSize: {_format_bytes(size)}\n"
+                        f"Bots: {len(db_load().get('bots', {}))}",
+                parse_mode="HTML",
+                visible_file_name=f"backup_{time.strftime('%Y%m%d_%H%M')}.zip",
+            )
+        target.unlink(missing_ok=True)
+        print(f"[auto-backup] sent {_format_bytes(size)}", flush=True)
+    except Exception as exc:
+        print(f"[auto-backup] failed: {exc}", flush=True)
+
+
+def _auto_backup_loop() -> None:
+    if not BACKUP_CHANNEL:
+        return
+    time.sleep(60)
+    while True:
+        try:
+            _do_auto_backup()
+        except Exception as exc:
+            print(f"[auto-backup] loop error: {exc}", flush=True)
+        time.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
+
+# 🆕 PATCH 3a: Health check
+def _check_bot_health(bot_id: str) -> Optional[str]:
+    try:
+        log = tail_logs(bot_id, lines=200)
+        if log == "No logs yet.":
+            return None
+        log_lower = log.lower()
+
+        if "401" in log and "unauthorized" in log_lower:
+            return "❌ <b>401 Unauthorized</b> — BOT_TOKEN invalid. Get new token from @BotFather."
+        if "409" in log and "conflict" in log_lower:
+            return "⚠️ <b>409 Conflict</b> — Same token running elsewhere."
+        if "429" in log:
+            return "⚠️ <b>429 Rate Limited</b> — Telegram throttling. Wait a few minutes."
+        if "modulenotfounderror" in log_lower:
+            m = re.search(r"ModuleNotFoundError: No module named '([^']+)'", log)
+            mod = m.group(1) if m else "unknown"
+            return f"❌ <b>Missing module</b>: <code>{esc(mod)}</code> — Install via 📦 Pip"
+        if "syntaxerror" in log_lower:
+            return "❌ <b>SyntaxError</b> — Python file has syntax error. Fix and re-upload."
+        if "importerror" in log_lower:
+            return "❌ <b>ImportError</b> — Module installed but can't import. Check 📜 Logs."
+        if "permissionerror" in log_lower:
+            return "⚠️ <b>PermissionError</b> — File access denied."
+        if "connectionerror" in log_lower or "timeout" in log_lower:
+            return "⚠️ <b>Connection error</b> — Network issue. Auto-recovers usually."
+        return None
+    except Exception:
+        return None
+
+
+# 🥈 Crash notification helper
+def _send_crash_notification(bot_id: str, exit_code: int) -> None:
+    try:
+        b = get_bot(bot_id)
+        if not b:
+            return
+        owner_uid = int(b.get("owner", 0))
+        if not owner_uid:
+            return
+        if exit_code in (0, None):
+            return
+        tail = tail_logs(bot_id, lines=20)
+        count = int(b.get("restart_count", 0))
+        delay = min(60, 2 ** min(count + 1, 6))
+        bot.send_message(
+            owner_uid,
+            f"🚨 <b>Bot Crashed!</b>\n\n"
+            f"Bot: <b>{esc(b['name'])}</b>\n"
+            f"ID: <code>{bot_id}</code>\n"
+            f"Exit code: <code>{exit_code}</code>\n\n"
+            f"<b>Last logs:</b>\n"
+            f"<pre>{esc(tail[-1000:])}</pre>\n\n"
+            f"⏱ Auto-restart in {delay}s...",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 def bot_status(bot_id: str) -> str:
     b = get_bot(bot_id)
@@ -718,14 +914,121 @@ def bot_status(bot_id: str) -> str:
                 pass
     if b.get("restart_interval"):
         lines.append(f"Auto-restart: {int(b['restart_interval'])} sec")
+    if b.get("daily_restart"):
+        lines.append(f"⏰ Daily restart: {b['daily_restart']} UTC")
+    # 🆕 PATCH 3b: Failed state + health display
+    if b.get("failed_state"):
+        lines.append(f"\n🔴 <b>AUTO-RESTART DISABLED</b>\n<i>{esc(b.get('failed_reason', '?'))}</i>")
+    health = _check_bot_health(bot_id)
+    if health:
+        lines.append(f"\n<b>Health:</b>\n{health}")
     return "\n".join(lines)
 
-# ── Telegram UI ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# REPLY KEYBOARD SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════
+def _btn(text: str, style: str = "primary") -> types.KeyboardButton:
+    try:
+        return types.KeyboardButton(text=text, style=style)
+    except TypeError:
+        return types.KeyboardButton(text=text)
+
+def _rkm(row_width: int = 2) -> types.ReplyKeyboardMarkup:
+    return types.ReplyKeyboardMarkup(
+        resize_keyboard=True, is_persistent=True, row_width=row_width
+    )
+
+def kb_main() -> types.ReplyKeyboardMarkup:
+    m = _rkm(2)
+    m.row(_btn("📦 My Bots", "primary"), _btn("➕ Upload Bot", "success"))
+    m.row(_btn("🐙 GitHub Host", "primary"), _btn("📊 Dashboard", "primary"))
+    m.row(_btn("❔ Help", "primary"))
+    return m
+
+def kb_bots(uid: int) -> types.ReplyKeyboardMarkup:
+    m = _rkm(1)
+    bots = BOT_INDEX.get(uid, [])
+    for i, bid in enumerate(bots[:30], 1):
+        b = get_bot(bid)
+        if b:
+            m.row(_btn(f"{i}. {b['name'][:40]}", "primary"))
+    m.row(_btn("⬅️ Main Menu", "primary"))
+    return m
+
+def kb_actions(uid: int) -> types.ReplyKeyboardMarkup:
+    bid = SELECTED_BOT.get(uid)
+    b = get_bot(bid) if bid else None
+    if not b:
+        return kb_main()
+    st = RUNNING.get(bid)
+    running = bool(st and st.get("proc") and st["proc"].poll() is None)
+    m = _rkm(2)
+    if running:
+        m.row(_btn("🔴 Stop", "danger"), _btn("🔄 Restart", "primary"))
+    else:
+        m.row(_btn("🟢 Start", "success"), _btn("🔄 Restart", "primary"))
+    m.row(_btn("📊 Status", "primary"), _btn("📜 Logs", "primary"))
+    # 🆕 PATCH 6c: Live button
+    m.row(_btn("🔴 Live", "danger"))
+    m.row(_btn("📁 Files", "primary"), _btn("🔐 Env Vars", "primary"))
+    m.row(_btn("📦 Pip", "primary"), _btn("🌐 Tunnel", "primary"))
+    m.row(_btn("⛔ Stop Tunnel", "danger"), _btn("🗃 Backup", "primary"))
+    m.row(_btn("✏️ Edit", "primary"), _btn("📋 Clone Bot", "primary"))
+    m.row(_btn("🗑 Delete Bot", "danger"))
+    m.row(_btn("⬅️ My Bots", "primary"))
+    return m
+
+def kb_env() -> types.ReplyKeyboardMarkup:
+    m = _rkm(2)
+    m.row(_btn("👁 Show Vars", "primary"))
+    m.row(_btn("➕ Set Variable", "success"), _btn("📥 Bulk Import", "success"))
+    m.row(_btn("➖ Delete Variable", "danger"))
+    m.row(_btn("⬅️ Bot Menu", "primary"))
+    return m
+
+def kb_backup() -> types.ReplyKeyboardMarkup:
+    m = _rkm(2)
+    m.row(_btn("⬇️ Download Backup", "primary"), _btn("♻️ Restore Backup", "primary"))
+    m.row(_btn("⬅️ Bot Menu", "primary"))
+    return m
+
+def kb_edit() -> types.ReplyKeyboardMarkup:
+    m = _rkm(2)
+    m.row(_btn("✏️ Rename", "primary"), _btn("🎯 Set Entry", "primary"))
+    m.row(_btn("⏰ Daily Restart", "primary"))
+    m.row(_btn("⬅️ Bot Menu", "primary"))
+    return m
+
+def kb_files() -> types.ReplyKeyboardMarkup:
+    m = _rkm(2)
+    m.row(_btn("📋 List Files", "primary"), _btn("➕ Upload File", "success"))
+    m.row(_btn("⬇️ Download File", "primary"), _btn("⬇️ Download Project", "primary"))
+    m.row(_btn("🗑 Delete File", "danger"))
+    m.row(_btn("⬅️ Bot Menu", "primary"))
+    return m
+
+def kb_delete_confirm() -> types.ReplyKeyboardMarkup:
+    m = _rkm(1)
+    m.row(_btn("🔴 YES DELETE", "danger"))
+    m.row(_btn("⬅️ Cancel", "primary"))
+    return m
+
+def current_kb(uid: int) -> types.ReplyKeyboardMarkup:
+    level = MENU_LEVEL.get(uid, "main")
+    if level == "bots":           return kb_bots(uid)
+    if level == "actions":        return kb_actions(uid)
+    if level == "env":            return kb_env()
+    if level == "backup":         return kb_backup()
+    if level == "edit":           return kb_edit()
+    if level == "files":          return kb_files()
+    if level == "delete_confirm": return kb_delete_confirm()
+    return kb_main()
+
+# ── Telegram UI ────────────────────────────────────────────────────────────
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8, parse_mode="HTML")
 
 def send_pre_chunks(chat_id: int, title: str, content: str,
-                    kb_markup: Optional[types.InlineKeyboardMarkup] = None) -> None:
-    """Send long text inside <pre>, split across messages (Telegram 4096-char limit)."""
+                    reply_markup: Optional[types.ReplyKeyboardMarkup] = None) -> None:
     LIMIT = 3800
     content = content or "(empty)"
     chunks: list[list[str]] = []
@@ -750,109 +1053,174 @@ def send_pre_chunks(chat_id: int, title: str, content: str,
         if len(text) > 4050:
             text = text[:4050] + "…</pre>"
         bot.send_message(chat_id, text,
-                         reply_markup=kb_markup if i == len(chunks) - 1 else None)
-
-def kb(rows: list[list[tuple[str, str]]]) -> types.InlineKeyboardMarkup:
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for row in rows:
-        markup.row(*(types.InlineKeyboardButton(text=t, callback_data=d) for t, d in row))
-    return markup
-
-def main_kb() -> types.InlineKeyboardMarkup:
-    return kb([
-        [('📦 My Bots', 'mybots'), ('➕ Upload Bot', 'upload')],
-        [('🐙 GitHub Host', 'github'), ('📊 Dashboard', 'dashboard')],
-        [('▶️ Start All', 'startall'), ('⏹ Stop All', 'stopall')],
-        [('❔ Help', 'help')],
-    ])
-
-def bot_kb(bot_id: str, running: bool) -> types.InlineKeyboardMarkup:
-    return kb([
-        [('⏹ Stop' if running else '▶️ Start', f"{'stop' if running else 'start'}:{bot_id}"),
-         ('🔄 Restart', f"restart:{bot_id}")],
-        [('📊 Status', f"status:{bot_id}"), ('📜 Logs', f"logs:{bot_id}")],
-        [('🔁 Crash Recovery', f"auto:{bot_id}"), ('⏱ Auto Restart', f"cron:{bot_id}")],
-        [('📁 Files', f"files:{bot_id}"), ('🔐 Env Vars', f"env:{bot_id}")],
-        [('📦 Pip', f"pip:{bot_id}"), ('🌐 Tunnel', f"tunnel:{bot_id}")],
-        [('⛔ Stop Tunnel', f"tunnelstop:{bot_id}"), ('⬇️ Download', f"download:{bot_id}")],
-        [('🗃 Backup/Restore', f"backup:{bot_id}"), ('✏️ Rename/Entry', f"edit:{bot_id}")],
-        [('📋 Clone Bot', f"clone:{bot_id}"), ('🗑 Delete', f"delete:{bot_id}")],
-        [('⬅️ My Bots', 'mybots')],
-    ])
-
-def send_home(chat_id: int, uid: int) -> None:
-    bot.send_message(chat_id,
-        "<b>⚡ Advanced Bot Hosting</b>\nHost & manage Python/Node bots.\n\nChoose:",
-        reply_markup=main_kb())
-
-def send_bot_card(chat_id: int, uid: int, bot_id: str) -> None:
-    b = owned_bot(uid, bot_id)
-    if not b:
-        bot.send_message(chat_id, "Bot not found.")
-        return
-    with _proc_lock:
-        st = RUNNING.get(bot_id)
-    running = bool(st and st.get("proc") and st["proc"].poll() is None)
-    bot.send_message(chat_id, bot_status(bot_id), reply_markup=bot_kb(bot_id, running))
+                         reply_markup=reply_markup if i == len(chunks) - 1 else None)
 
 def set_state(uid: int, flow: str, bot_id: Optional[str] = None, **extra: Any) -> None:
     STATES[uid] = {"flow": flow, "bot_id": bot_id, **extra}
 
 def throttled(uid: int) -> bool:
     now = time.time()
-    if now - LAST_ACTION.get(uid, 0) < 0.7:
+    if now - LAST_ACTION.get(uid, 0) < 0.5:
         return True
     LAST_ACTION[uid] = now
     return False
 
+def _reset_menus(uid: int) -> None:
+    MENU_LEVEL.pop(uid, None)
+    SELECTED_BOT.pop(uid, None)
+    BOT_INDEX.pop(uid, None)
+    STATES.pop(uid, None)
+
+def send_home(chat_id: int, uid: int, celebrate: bool = False) -> None:
+    MENU_LEVEL[uid] = "main"
+    header = "🎉 <b>Rᴜsʜᴇʀ Kɪɴɢ</b> 🎉\n\n" if celebrate else ""
+    text = (
+        f"{header}"
+        "<b>⚡ Advanced Bot Hosting</b>\n"
+        "Host & manage Python/Node bots.\n\n"
+        "Choose:"
+    )
+    if celebrate:
+        try:
+            bot.send_message(chat_id, text, reply_markup=kb_main(), message_effect_id=PARTY_EFFECT_ID)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, reply_markup=kb_main())
+
+def show_bots(chat_id: int, uid: int) -> None:
+    bots = user_bots(uid)
+    BOT_INDEX[uid] = [b["id"] for b in bots]
+    STATES.pop(uid, None)
+    if not bots:
+        MENU_LEVEL[uid] = "main"
+        bot.send_message(chat_id, "No bots yet. Just send me a .py / .js / .zip file to get started!",
+                         reply_markup=kb_main())
+        return
+    MENU_LEVEL[uid] = "bots"
+    lines = [f"<b>📦 My Bots</b> · {len(bots)}/{MAX_BOTS_PER_USER}", ""]
+    for i, b in enumerate(bots[:30], 1):
+        st = RUNNING.get(b["id"])
+        running = bool(st and st.get("proc") and st["proc"].poll() is None)
+        icon = "🟢" if running else "🔴"
+        lines.append(f"{i}. {icon} <b>{esc(b['name'][:60])}</b>")
+    if len(bots) > 30:
+        lines.append(f"\n... and {len(bots)-30} more (see 📊 Dashboard)")
+    lines.append("\nTap a bot below to manage it.")
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_bots(uid))
+
+def show_bot_card(chat_id: int, uid: int, bot_id: str) -> None:
+    b = owned_bot(uid, bot_id)
+    if not b:
+        MENU_LEVEL[uid] = "main"
+        bot.send_message(chat_id, "Bot not found.", reply_markup=kb_main())
+        return
+    SELECTED_BOT[uid] = bot_id
+    MENU_LEVEL[uid] = "actions"
+    STATES.pop(uid, None)
+    bot.send_message(chat_id, bot_status(bot_id), reply_markup=kb_actions(uid))
+
 def show_dashboard(chat_id: int, uid: int) -> None:
+    MENU_LEVEL[uid] = "main"
     items = user_bots(uid)
     if not items:
-        bot.send_message(chat_id, "No bots yet.", reply_markup=main_kb())
+        bot.send_message(chat_id, "No bots yet.", reply_markup=kb_main())
         return
     lines = [f"<b>📊 Dashboard — {len(items)}/{MAX_BOTS_PER_USER} bots</b>\n"]
     running_count = 0
     for b in items[:200]:
-        state = RUNNING.get(b["id"])
-        running = state and state.get("proc") and state["proc"].poll() is None
+        st = RUNNING.get(b["id"])
+        running = bool(st and st.get("proc") and st["proc"].poll() is None)
         if running:
             running_count += 1
         icon = "🟢" if running else ("⚠️" if b.get("resource_killed") else "🔴")
         extra = ""
         if running and psutil:
             try:
-                p = psutil.Process(state["proc"].pid)
-                extra = f" | {_format_bytes(p.memory_info().rss)} | {int(time.time() - state['started'])}s"
+                p = psutil.Process(st["proc"].pid)
+                extra = f" | {_format_bytes(p.memory_info().rss)} | {int(time.time() - st['started'])}s"
             except Exception:
                 pass
         lines.append(f"{icon} <code>{b['id']}</code> <b>{esc(b['name'][:60])}</b>{extra}")
     lines.append(f"\n🟢 Running: {running_count} / {len(items)}")
-    bot.send_message(chat_id, "\n".join(lines),
-        reply_markup=kb([[("🔄 Refresh", "dashboard"), ("⬅️ Home", "home")]]))
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_main())
+
+def show_env(chat_id: int, uid: int, bot_id: str) -> None:
+    b = owned_bot(uid, bot_id)
+    if not b:
+        MENU_LEVEL[uid] = "main"
+        bot.send_message(chat_id, "Bot not found.", reply_markup=kb_main())
+        return
+    SELECTED_BOT[uid] = bot_id
+    MENU_LEVEL[uid] = "env"
+    STATES.pop(uid, None)
+    envs = decrypt_obj(b.get("env_enc", ""))
+    if envs:
+        lines = ["<b>🔐 Env Vars</b>", ""]
+        for k, v in envs.items():
+            masked = "•" * min(len(v), 12) if v else "(empty)"
+            lines.append(f"<code>{esc(k)}</code> = <code>{masked}</code>")
+        body = "\n".join(lines)
+    else:
+        body = "<b>🔐 Env Vars</b>\n\nNo custom variables yet."
+    bot.send_message(chat_id, body, reply_markup=kb_env())
+
+def show_files(chat_id: int, uid: int, bot_id: str) -> None:
+    b = owned_bot(uid, bot_id)
+    if not b:
+        MENU_LEVEL[uid] = "main"
+        bot.send_message(chat_id, "Bot not found.", reply_markup=kb_main())
+        return
+    SELECTED_BOT[uid] = bot_id
+    MENU_LEVEL[uid] = "files"
+    STATES.pop(uid, None)
+    files = project_files(bot_id)
+    if not files:
+        body = "<b>📁 Files</b>\n\nNo files."
+    else:
+        root = project_dir(bot_id)
+        lines = ["<b>📁 Files</b>", ""]
+        total = 0
+        for p in files[:200]:
+            sz = p.stat().st_size
+            total += sz
+            lines.append(f"<code>{esc(p.relative_to(root).as_posix())}</code> · {_format_bytes(sz)}")
+        if len(files) > 200:
+            lines.append(f"\n... and {len(files)-200} more")
+        lines.append(f"\nTotal: {_format_bytes(total)}")
+        body = "\n".join(lines)
+    bot.send_message(chat_id, body, reply_markup=kb_files())
 
 # ── Commands ──────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start", "menu"])
 def cmd_start(m: types.Message) -> None:
     if m.chat.type != "private":
         return
-    STATES.pop(m.from_user.id, None)
-    if not get_user(m.from_user.id):
-        save_user(m.from_user.id, id=m.from_user.id,
+    uid = m.from_user.id
+    _reset_menus(uid)
+    if not get_user(uid):
+        save_user(uid, id=uid,
                   name=m.from_user.first_name or "",
                   username=m.from_user.username or "",
                   joined=int(time.time()))
-    send_home(m.chat.id, m.from_user.id)
+    send_home(m.chat.id, uid, celebrate=True)
 
 @bot.message_handler(commands=["help"])
 def cmd_help(m: types.Message) -> None:
+    ram = f"{MAX_BOT_RAM_MB} MB" if MAX_BOT_RAM_MB else "unlimited"
+    disk = f"{MAX_BOT_DISK_MB} MB" if MAX_BOT_DISK_MB else "unlimited"
     bot.reply_to(m,
         "<b>Help</b>\n"
-        "• Upload .py/.js/.zip or clone public/private GitHub\n"
+        "• Send .py/.js/.zip directly → bot auto-created and started\n"
+        "• Or use 🐙 GitHub Host to clone a repo\n"
         "• Each project gets its own Python venv\n"
         "• Env vars encrypted at rest\n"
         "• Auto-pip installs missing imports\n"
-        "• RAM cap: " + (f"{MAX_BOT_RAM_MB} MB" if MAX_BOT_RAM_MB else "unlimited") + "\n"
-        "• Commands: /start /bots /cancel /id")
+        f"• Upload limit: {_MAX_MB} MB\n"
+        f"• RAM cap: {ram}\n"
+        f"• Disk cap: {disk}\n"
+        "• Commands: /start /bots /cancel /id /token /grep",
+        reply_markup=current_kb(m.from_user.id))
 
 @bot.message_handler(commands=["bots"])
 def cmd_bots(m: types.Message) -> None:
@@ -860,380 +1228,742 @@ def cmd_bots(m: types.Message) -> None:
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(m: types.Message) -> None:
-    STATES.pop(m.from_user.id, None)
-    bot.reply_to(m, "Cancelled.")
+    uid = m.from_user.id
+    STATES.pop(uid, None)
+    bot.reply_to(m, "Cancelled.", reply_markup=current_kb(uid))
 
 @bot.message_handler(commands=["id"])
 def cmd_id(m: types.Message) -> None:
     bot.reply_to(m, f"<code>{m.from_user.id}</code>")
 
-def show_bots(chat_id: int, uid: int) -> None:
-    items = user_bots(uid)
-    if not items:
-        bot.send_message(chat_id, "No bots yet.", reply_markup=main_kb())
-        return
-    rows = []
-    for item in items[:200]:
-        state = RUNNING.get(item["id"])
-        running = state and state.get("proc") and state["proc"].poll() is None
-        label = ("🟢 " if running else "⚫ ") + item["name"][:60]
-        rows.append([(label, f"view:{item['id']}")])
-    rows.append([("➕ Upload Bot", "upload"), ("⬅️ Home", "home")])
-    bot.send_message(chat_id, f"<b>My Bots</b> · {len(items)}/{MAX_BOTS_PER_USER}",
-                     reply_markup=kb(rows))
+@bot.message_handler(commands=["token"])
+def cmd_token(m: types.Message) -> None:
+    set_state(m.from_user.id, "gh_token")
+    bot.reply_to(m, "Send GitHub personal access token:\n/cancel to abort.")
 
-# ── Callbacks ─────────────────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda c: True)
-def callback(c: types.CallbackQuery) -> None:
-    uid = c.from_user.id
-    data = c.data or ""
+@bot.message_handler(commands=["grep"])
+def cmd_grep(m: types.Message) -> None:
+    uid = m.from_user.id
+    bid = SELECTED_BOT.get(uid)
+    if not bid:
+        bot.reply_to(m, "Pehle koi bot select karo (📦 My Bots → bot)")
+        return
+    args = (m.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        bot.reply_to(
+            m,
+            "Usage: <code>/grep ERROR</code>\n\n"
+            "Examples:\n"
+            "<code>/grep ERROR</code>\n"
+            "<code>/grep Traceback</code>\n"
+            "<code>/grep 409</code>\n"
+            "<code>/grep ModuleNotFound</code>",
+            parse_mode="HTML",
+        )
+        return
+    pattern = args[1].strip()
+    log = tail_logs(bid, lines=5000)
+    if log == "No logs yet.":
+        bot.reply_to(m, "No logs available.")
+        return
+    matches = [ln for ln in log.splitlines() if pattern.lower() in ln.lower()]
+    if not matches:
+        bot.reply_to(
+            m,
+            f"🔍 No matches for <code>{esc(pattern)}</code> in last 5000 lines.",
+            parse_mode="HTML",
+        )
+        return
+    matches = matches[-100:]
+    title = f"🔍 '{pattern}' — {len(matches)} match(es)"
+    send_pre_chunks(m.chat.id, title, "\n".join(matches),
+                    reply_markup=kb_actions(uid))
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UPLOAD + AUTO-START
+# ═══════════════════════════════════════════════════════════════════════════
+def _do_upload_new_bot(m: types.Message) -> None:
+    uid = m.from_user.id
+    doc = m.document
+    if not doc:
+        return
+    fname = safe_name(doc.file_name or "upload.bin")
+    fname_lower = fname.lower()
+
+    if not fname_lower.endswith((".py", ".js", ".mjs", ".cjs", ".zip")):
+        bot.reply_to(
+            m,
+            f"❌ Unsupported file type: <code>{esc(fname)}</code>\n\n"
+            f"Allowed: <code>.py</code>, <code>.js</code>, <code>.mjs</code>, <code>.cjs</code>, <code>.zip</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    rec = None
     try:
-        bot.answer_callback_query(c.id)
-    except Exception:
-        pass
-    if throttled(uid):
-        return
-    if data == "home":
-        send_home(c.message.chat.id, uid); return
-    if data == "help":
-        bot.send_message(c.message.chat.id, "Send .py/.js/.zip after Upload. GitHub accepts HTTPS URLs."); return
-    if data == "mybots":
-        show_bots(c.message.chat.id, uid); return
-    if data == "dashboard":
-        show_dashboard(c.message.chat.id, uid); return
-    if data == "upload":
-        set_state(uid, "upload_new")
-        bot.send_message(c.message.chat.id,
-            "Send .py / .js / .zip (max 20 MB).\n\n/cancel to abort.")
-        return
-    if data == "github":
-        set_state(uid, "github_url")
-        bot.send_message(c.message.chat.id,
-            "Send GitHub repo URL.\nPublic: https://github.com/user/repo\n\n"
-            "Private: set token first via /menu → GitHub Host → Set Token.")
-        return
-    if data == "startall":
-        items = user_bots(uid)
-        ok = 0
-        for b in items:
-            st = RUNNING.get(b["id"])
-            if not (st and st.get("proc") and st["proc"].poll() is None):
-                r, _ = start_process(b["id"])
-                ok += int(r)
-        bot.send_message(c.message.chat.id, f"Started {ok} bot(s).")
-        show_dashboard(c.message.chat.id, uid)
-        return
-    if data == "stopall":
-        items = user_bots(uid)
-        for b in items:
-            mutate_bot(b["id"], desired_running=False)
-            stop_process(b["id"])
-        bot.send_message(c.message.chat.id, f"Stopped {len(items)} bot(s).")
-        show_dashboard(c.message.chat.id, uid)
-        return
-    if data == "gh_token":
-        set_state(uid, "gh_token")
-        bot.send_message(c.message.chat.id, "Send GitHub personal access token:")
-        return
-    if data.startswith("view:"):
-        send_bot_card(c.message.chat.id, uid, data.split(":", 1)[1]); return
-    if ":" not in data:
-        return
-
-    parts = data.split(":")
-    action = parts[0]
-    bot_id = parts[1] if len(parts) > 1 else ""
-    extra = ":".join(parts[2:]) if len(parts) > 2 else ""
-    b = owned_bot(uid, bot_id)
-    if not b:
-        bot.send_message(c.message.chat.id, "Bot not found."); return
-    root = project_dir(bot_id)
-
-    if action == "start":
-        ok, msg = start_process(bot_id)
-        bot.send_message(c.message.chat.id, ("✅ " if ok else "❌ ") + esc(msg))
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "stop":
-        mutate_bot(bot_id, desired_running=False)
-        msg = stop_process(bot_id)
-        bot.send_message(c.message.chat.id, "⏹ " + esc(msg))
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "restart":
-        ok, msg = restart_process(bot_id)
-        bot.send_message(c.message.chat.id, ("✅ " if ok else "❌ ") + esc(msg))
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "status":
-        st = RUNNING.get(bot_id)
-        running = bool(st and st.get("proc") and st["proc"].poll() is None)
-        bot.send_message(c.message.chat.id, bot_status(bot_id),
-                         reply_markup=bot_kb(bot_id, running))
-    elif action == "auto":
-        enabled = not bool(b.get("auto_restart", True))
-        mutate_bot(bot_id, auto_restart=enabled)
-        bot.send_message(c.message.chat.id, f"Crash recovery {'on' if enabled else 'off'}.")
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "logs":
-        text = tail_logs(bot_id)
-        send_pre_chunks(
-            c.message.chat.id, "Logs", text,
-            kb_markup=kb([[('🔄 Refresh', f'logs:{bot_id}'), ('🧹 Clear', f'clearlogs:{bot_id}')],
-                          [('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "clearlogs":
         try:
-            _log_path(bot_id).write_text("", encoding="utf-8")
+            status_msg = bot.reply_to(m, "📥 <b>Downloading file...</b>", parse_mode="HTML")
         except Exception:
-            pass
-        bot.send_message(c.message.chat.id, "Logs cleared.",
-                         reply_markup=kb([[('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "files":
-        files = project_files(bot_id)
-        lines = [f"<code>{esc(p.relative_to(root).as_posix())}</code> · {_format_bytes(p.stat().st_size)}"
-                 for p in files[:200]]
-        choices = [p.relative_to(root).as_posix() for p in files[:50]]
-        STATES[uid] = {"flow": "file_select", "bot_id": bot_id, "files": choices}
-        rows = [
-            [("➕ Upload File", f"fileupload:{bot_id}"), ("🗑 Delete File", f"filedel:{bot_id}")],
-            [("⬇️ Download Project", f"download:{bot_id}")],
-        ]
-        for i, rel in enumerate(choices):
-            rows.append([(f"📄 {rel[:30]}", f"fileview:{bot_id}:{i}")])
-        rows.append([("⬅️ Back", f"view:{bot_id}")])
-        bot.send_message(c.message.chat.id,
-            "<b>Project files</b>\n" + ("\n".join(lines) if lines else "No files."),
-            reply_markup=kb(rows))
-    elif action == "fileview":
-        try:
-            choices = STATES.get(uid, {})
-            files_for_user = choices.get("files", []) if choices.get("bot_id") == bot_id else []
-            rel = files_for_user[int(extra)]
-            target = safe_project_path(root, rel)
-            if not target.is_file():
-                raise ValueError("Not found")
-            if target.stat().st_size > 200 * 1024 * 1024:
-                raise ValueError("File too large to preview (200 MB) — use Download")
-            content = target.read_text(encoding="utf-8", errors="replace")
-            if len(content) > 100_000:
-                content = content[:100_000] + "\n\n... (truncated, use Download for full file)"
-            send_pre_chunks(c.message.chat.id, rel, content,
-                            kb_markup=kb([[("⬅️ Back", f"files:{bot_id}")]]))
-        except Exception as exc:
-            bot.send_message(c.message.chat.id, "View failed: " + esc(exc))
-    elif action == "fileupload":
-        set_state(uid, "upload_file", bot_id)
-        bot.send_message(c.message.chat.id, "Send a file to add/replace.")
-    elif action == "filedel":
-        set_state(uid, "file_delete", bot_id)
-        bot.send_message(c.message.chat.id, "Send relative path (e.g. <code>src/main.py</code>).")
-    elif action == "env":
-        envs = decrypt_obj(b.get("env_enc", ""))
-        text = "\n".join(
-            f"<code>{esc(k)}</code> = <code>{'•' * min(len(v), 12)}</code>"
-            for k, v in envs.items()) or "No custom vars."
-        bot.send_message(c.message.chat.id,
-            "<b>Env Vars</b>\n" + text,
-            reply_markup=kb([[('➕ Set One', f'envset:{bot_id}'), ('📥 Bulk Import', f'envbulk:{bot_id}')],
-                             [('➖ Delete', f'envdel:{bot_id}')],
-                             [('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "envset":
-        set_state(uid, "env_set", bot_id)
-        bot.send_message(c.message.chat.id, "Send KEY=VALUE")
-    elif action == "envbulk":
-        set_state(uid, "env_bulk", bot_id)
-        bot.send_message(c.message.chat.id,
-            "Send multiple lines, one per var:\n<code>KEY1=val1\nKEY2=val2</code>\n\nSend /cancel to abort.")
-    elif action == "envdel":
-        set_state(uid, "env_delete", bot_id)
-        bot.send_message(c.message.chat.id, "Send the variable name to delete.")
-    elif action == "pip":
-        set_state(uid, "pip_install", bot_id)
-        bot.send_message(c.message.chat.id,
-            "Send packages separated by spaces.\n<code>requests python-dotenv</code>\n\n"
-            "Send <code>requirements</code> to install requirements.txt.\n"
-            "Send <code>auto</code> to scan imports and install missing.")
-    elif action == "cron":
-        cur = int(b.get("restart_interval", 0))
-        bot.send_message(c.message.chat.id,
-            f"Periodic restart: {cur or 'OFF'} sec",
-            reply_markup=kb([[('Off', f'cronset:{bot_id}:0'), ('30 min', f'cronset:{bot_id}:1800')],
-                             [('1 hour', f'cronset:{bot_id}:3600'), ('6 hours', f'cronset:{bot_id}:21600')],
-                             [('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "cronset":
-        sec = int(extra)
-        mutate_bot(bot_id, restart_interval=sec, last_interval_restart=int(time.time()))
-        bot.send_message(c.message.chat.id, f"Periodic restart: {sec or 'OFF'} sec.")
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "tunnel":
-        set_state(uid, "tunnel_port", bot_id)
-        bot.send_message(c.message.chat.id,
-            "Send local port for Cloudflare quick tunnel (requires cloudflared).")
-    elif action == "tunnelstop":
-        with _proc_lock:
-            tunnel = RUNNING.get(bot_id, {}).get("tunnel")
-        if tunnel:
-            try:
-                if os.name == "nt":
-                    if tunnel.poll() is None:
-                        tunnel.terminate()
-                else:
-                    os.killpg(tunnel.pid, signal.SIGTERM)
-                with _proc_lock:
-                    if bot_id in RUNNING:
-                        RUNNING[bot_id]["tunnel"] = None
-                bot.send_message(c.message.chat.id, "⛔ Tunnel stopped.")
-            except Exception as exc:
-                bot.send_message(c.message.chat.id, "Stop failed: " + esc(exc))
-        else:
-            bot.send_message(c.message.chat.id, "No tunnel running.")
-    elif action == "download":
-        try:
-            raw = make_backup(bot_id)
-            buf = io.BytesIO(raw)
-            buf.name = f"{safe_name(b['name'])}-{bot_id}.zip"
-            bot.send_document(c.message.chat.id, buf,
-                caption="Full backup (source + bot_meta.json; env excluded from source files).")
-        except Exception as exc:
-            bot.send_message(c.message.chat.id, "Failed: " + esc(exc))
-    elif action == "backup":
-        bot.send_message(c.message.chat.id,
-            "Backup ZIP = source + bot_meta.json (env, name, cron).",
-            reply_markup=kb([[('⬇️ Download', f'download:{bot_id}')],
-                             [('♻️ Restore ZIP', f'restore:{bot_id}')],
-                             [('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "restore":
-        set_state(uid, "restore_zip", bot_id)
-        bot.send_message(c.message.chat.id, "Send a ZIP backup. Source files will be replaced.")
-    elif action == "edit":
-        bot.send_message(c.message.chat.id, "Choose:",
-            reply_markup=kb([[('✏️ Rename', f'rename:{bot_id}'), ('🎯 Set Entry', f'entry:{bot_id}')],
-                             [('⬅️ Back', f'view:{bot_id}')]]))
-    elif action == "rename":
-        set_state(uid, "rename", bot_id)
-        bot.send_message(c.message.chat.id, "Send new name (max 200 chars).")
-    elif action == "entry":
-        files = [p.relative_to(root).as_posix() for p in project_files(bot_id)
-                 if p.suffix.lower() in {".py", ".js", ".mjs", ".cjs"}]
-        if not files:
-            bot.send_message(c.message.chat.id, "No entry candidates.")
-            return
-        STATES[uid] = {"flow": "entry_select", "bot_id": bot_id, "entries": files[:200]}
-        rows = [[(f[:35], f'entrypick:{bot_id}:{i}')] for i, f in enumerate(files[:200])]
-        rows.append([('⬅️ Back', f'view:{bot_id}')])
-        bot.send_message(c.message.chat.id, "Select entry:", reply_markup=kb(rows))
-    elif action == "entrypick":
-        choices = STATES.get(uid, {}).get("entries", [])
-        try:
-            idx = int(extra)
-            if idx < 0 or idx >= len(choices):
-                raise ValueError("Selection expired")
-            rel = choices[idx]
-        except (ValueError, IndexError):
-            bot.send_message(c.message.chat.id, "Selection expired.")
-            return
-        try:
-            target = safe_project_path(root, rel)
-            if not target.is_file() or target.suffix.lower() not in {".py", ".js", ".mjs", ".cjs"}:
-                raise ValueError("Invalid entry")
-            mutate_bot(bot_id, entry=rel)
-            bot.send_message(c.message.chat.id, f"Entry → <code>{esc(rel)}</code>")
-        except Exception as exc:
-            bot.send_message(c.message.chat.id, "Failed: " + esc(exc))
-        send_bot_card(c.message.chat.id, uid, bot_id)
-    elif action == "clone":
-        try:
-            new_rec = clone_bot(uid, bot_id)
-            if new_rec:
-                bot.send_message(c.message.chat.id,
-                    f"📋 Cloned as <b>{esc(new_rec['name'])}</b>\nID: <code>{new_rec['id']}</code>")
-                send_bot_card(c.message.chat.id, uid, new_rec["id"])
-        except Exception as exc:
-            bot.send_message(c.message.chat.id, "Clone failed: " + esc(exc))
-    elif action == "delete":
-        bot.send_message(c.message.chat.id,
-            f"Delete <b>{esc(b['name'])}</b> and all files?",
-            reply_markup=kb([[('❌ Confirm', f'deleteyes:{bot_id}')], [('Cancel', f'view:{bot_id}')]]))
-    elif action == "deleteyes":
-        stop_process(bot_id)
-        d = db_load()
-        d["bots"].pop(bot_id, None)
-        db_save(d)
-        shutil.rmtree(root, ignore_errors=True)
-        bot.send_message(c.message.chat.id, "Deleted.", reply_markup=main_kb())
+            status_msg = None
 
-# ── Document uploads ─────────────────────────────────────────────────────
+        def _edit_status(text: str) -> None:
+            if not status_msg:
+                return
+            try:
+                bot.edit_message_text(text, chat_id=status_msg.chat.id,
+                                      message_id=status_msg.message_id,
+                                      parse_mode="HTML")
+            except Exception:
+                pass
+
+        info = bot.get_file(doc.file_id)
+        raw = bot.download_file(info.file_path)
+
+        _edit_status("📦 <b>Extracting &amp; saving...</b>")
+
+        rec = _create_record(uid, Path(fname).stem)
+        root = project_dir(rec["id"])
+
+        if fname_lower.endswith(".zip"):
+            count = safe_extract_zip(raw, root)
+        else:
+            (root / fname).write_bytes(raw)
+            count = 1
+
+        entry = detect_entry(root)
+        mutate_bot(rec["id"], entry=entry)
+
+        _edit_status("🔍 <b>Running security scan...</b>")
+
+        hardcoded = _scan_hardcoded_token(rec["id"])
+
+        STATES.pop(uid, None)
+        if status_msg:
+            try:
+                bot.delete_message(status_msg.chat.id, status_msg.message_id)
+            except Exception:
+                pass
+
+        bot.send_message(
+            m.chat.id,
+            f"✅ <b>{esc(rec['name'])}</b>\n"
+            f"Files: {count}\n"
+            f"Entry: <code>{esc(entry)}</code>",
+            parse_mode="HTML",
+        )
+
+        if hardcoded:
+            masked = hardcoded[:12] + "..." + hardcoded[-4:]
+            bot.send_message(
+                m.chat.id,
+                f"⚠️ <b>Security Warning — Hardcoded BOT_TOKEN Detected!</b>\n\n"
+                f"Found in source: <code>{esc(masked)}</code>\n\n"
+                f"<b>Why is this bad?</b>\n"
+                f"• Token leaks if you share code, screenshot, or backup\n"
+                f"• Anyone with token can control your bot\n\n"
+                f"<b>How to fix (recommended):</b>\n"
+                f"1. Remove token from your code\n"
+                f"2. Use <code>os.getenv('BOT_TOKEN')</code> instead\n"
+                f"3. Add BOT_TOKEN via 🔐 Env Vars\n\n"
+                f"<b>Example:</b>\n"
+                f"<pre>import os, telebot\n"
+                f"bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))</pre>",
+                parse_mode="HTML",
+            )
+
+            # 🆕 PATCH 2b: Duplicate token check
+            dup_bot_id = _find_duplicate_token(uid, rec["id"], hardcoded)
+            if dup_bot_id:
+                dup_bot = get_bot(dup_bot_id)
+                dup_name = dup_bot["name"] if dup_bot else dup_bot_id
+                bot.send_message(
+                    m.chat.id,
+                    f"🔴 <b>Duplicate Token Detected!</b>\n\n"
+                    f"Token already used by: <b>{esc(dup_name)}</b>\n\n"
+                    f"Telegram will throw <b>409 Conflict</b> — both bots fail.\n\n"
+                    f"<b>Fix:</b> Use a different BOT_TOKEN.\n\n"
+                    f"Bot created but <b>NOT auto-started</b>.",
+                    parse_mode="HTML",
+                )
+                mutate_bot(rec["id"], failed_state=True, failed_reason="Duplicate token")
+                show_bot_card(m.chat.id, uid, rec["id"])
+                return
+
+        start_msg = bot.send_message(
+            m.chat.id,
+            f"🚀 <b>Auto-starting {esc(rec['name'])}...</b>\n"
+            f"<i>Installing dependencies and starting. This may take 30-60s...</i>",
+            parse_mode="HTML",
+        )
+
+        def _bg_start():
+            try:
+                ok, msg = start_process(rec["id"], manual=False)
+                if ok:
+                    try:
+                        bot.edit_message_text(
+                            f"🟢 <b>{esc(rec['name'])}</b> ✅ started\n{esc(msg)}",
+                            chat_id=start_msg.chat.id,
+                            message_id=start_msg.message_id,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        bot.edit_message_text(
+                            f"❌ <b>Start failed</b>: {esc(msg)}\n\n"
+                            f"Tip: check logs with 📜 Logs, or set BOT_TOKEN via 🔐 Env Vars then press 🟢 Start",
+                            chat_id=start_msg.chat.id,
+                            message_id=start_msg.message_id,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                try:
+                    bot.edit_message_text(
+                        f"❌ Start error: <code>{esc(exc)}</code>",
+                        chat_id=start_msg.chat.id,
+                        message_id=start_msg.message_id,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+        threading.Thread(target=_bg_start, daemon=True, name=f"auto-start-{rec['id']}").start()
+
+        def _show_card_after():
+            time.sleep(2.0)
+            try:
+                show_bot_card(m.chat.id, uid, rec["id"])
+            except Exception:
+                pass
+        threading.Thread(target=_show_card_after, daemon=True).start()
+
+    except Exception as exc:
+        if rec:
+            try:
+                shutil.rmtree(project_dir(rec["id"]), ignore_errors=True)
+                d = db_load(); d["bots"].pop(rec["id"], None); db_save(d)
+            except Exception:
+                pass
+        STATES.pop(uid, None)
+        bot.reply_to(m, "❌ " + esc(exc), reply_markup=current_kb(uid))
+
+
+# ── Document handler ─────────────────────────────────────────────────────
 @bot.message_handler(content_types=["document"])
 def on_document(m: types.Message) -> None:
     uid = m.from_user.id
     st = STATES.get(uid, {})
     flow = st.get("flow")
-    if flow not in {"upload_new", "upload_file", "restore_zip"}:
-        bot.reply_to(m, "Tap Upload Bot or File Manager first.")
-        return
     doc = m.document
-    if not doc or (doc.file_size or 0) > MAX_UPLOAD:
-        bot.reply_to(m, f"Too large. Max {_format_bytes(MAX_UPLOAD)}."); return
-    rec = None
-    try:
-        info = bot.get_file(doc.file_id)
-        raw = bot.download_file(info.file_path)
-        fname = safe_name(doc.file_name or "upload.bin")
-        if flow == "upload_new":
-            rec = _create_record(uid, Path(fname).stem)
-            root = project_dir(rec["id"])
-            if fname.lower().endswith(".zip"):
-                count = safe_extract_zip(raw, root)
-            elif Path(fname).suffix.lower() in {".py", ".js", ".mjs", ".cjs"}:
-                (root / fname).write_bytes(raw)
-                count = 1
-            else:
-                shutil.rmtree(root, ignore_errors=True)
-                d = db_load(); d["bots"].pop(rec["id"], None); db_save(d)
-                raise ValueError("Only .py/.js/.mjs/.cjs/.zip")
-            entry = detect_entry(root)
-            mutate_bot(rec["id"], entry=entry)
+    if not doc:
+        return
+
+    if (doc.file_size or 0) > MAX_UPLOAD:
+        bot.reply_to(
+            m,
+            f"❌ File too large. Max {_format_bytes(MAX_UPLOAD)}.",
+            reply_markup=current_kb(uid),
+        )
+        return
+
+    fname = safe_name(doc.file_name or "upload.bin")
+    fname_lower = fname.lower()
+
+    if flow == "restore_zip":
+        bid = st.get("bot_id")
+        if not bid or not owned_bot(uid, bid):
+            bot.reply_to(m, "Access denied.", reply_markup=current_kb(uid))
             STATES.pop(uid, None)
-            bot.reply_to(m, f"✅ <b>{esc(rec['name'])}</b>\nFiles: {count}\nEntry: <code>{esc(entry)}</code>")
-            send_bot_card(m.chat.id, uid, rec["id"])
-        elif flow == "upload_file":
-            bid = st.get("bot_id")
-            if not owned_bot(uid, bid):
-                raise ValueError("Access denied")
-            if fname.lower().endswith(".zip") or len(raw) > MAX_SINGLE_FILE:
-                raise ValueError("ZIP / oversized files not allowed here")
+            return
+        if not fname_lower.endswith(".zip"):
+            bot.reply_to(m, "Restore requires ZIP.", reply_markup=current_kb(uid))
+            return
+        try:
+            info = bot.get_file(doc.file_id)
+            raw = bot.download_file(info.file_path)
+            count = restore_backup(bid, raw)
+            STATES.pop(uid, None)
+            bot.reply_to(m, f"✅ Restored {count} files.")
+            show_bot_card(m.chat.id, uid, bid)
+        except Exception as exc:
+            STATES.pop(uid, None)
+            bot.reply_to(m, "❌ " + esc(exc), reply_markup=current_kb(uid))
+        return
+
+    if flow == "upload_file":
+        bid = st.get("bot_id")
+        if not bid or not owned_bot(uid, bid):
+            bot.reply_to(m, "Access denied.", reply_markup=current_kb(uid))
+            STATES.pop(uid, None)
+            return
+        if fname_lower.endswith(".zip"):
+            bot.reply_to(m, "ZIP not allowed here. Upload as a new bot instead.",
+                         reply_markup=current_kb(uid))
+            return
+        try:
+            info = bot.get_file(doc.file_id)
+            raw = bot.download_file(info.file_path)
             target = safe_project_path(project_dir(bid), fname)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
             STATES.pop(uid, None)
-            bot.reply_to(m, f"✅ Saved <code>{esc(fname)}</code>")
-            send_bot_card(m.chat.id, uid, bid)
-        elif flow == "restore_zip":
-            bid = st.get("bot_id")
-            if not owned_bot(uid, bid):
-                raise ValueError("Access denied")
-            if not fname.lower().endswith(".zip"):
-                raise ValueError("Restore requires ZIP")
-            count = restore_backup(bid, raw)
+            bot.reply_to(m, f"✅ Saved <code>{esc(fname)}</code>",
+                         reply_markup=kb_files())
+        except Exception as exc:
             STATES.pop(uid, None)
-            bot.reply_to(m, f"✅ Restored {count} files.")
-            send_bot_card(m.chat.id, uid, bid)
-    except Exception as exc:
-        if flow == "upload_new" and rec:
-            shutil.rmtree(project_dir(rec["id"]), ignore_errors=True)
-            d = db_load(); d["bots"].pop(rec["id"], None); db_save(d)
-        bot.reply_to(m, "❌ " + esc(exc))
+            bot.reply_to(m, "❌ " + esc(exc), reply_markup=current_kb(uid))
+        return
 
-# ── Text handler (state machine) ─────────────────────────────────────────
+    _do_upload_new_bot(m)
+
+
+# ── Bot action router ────────────────────────────────────────────────────
+def _handle_bot_action(m: types.Message, uid: int, text: str, bid: str) -> bool:
+    b = owned_bot(uid, bid)
+    if not b:
+        bot.send_message(m.chat.id, "Bot not found.", reply_markup=kb_main())
+        MENU_LEVEL[uid] = "main"
+        return True
+    st = RUNNING.get(bid)
+    running = bool(st and st.get("proc") and st["proc"].poll() is None)
+
+    if text in ("🟢 Start", "🔴 Stop"):
+        if running:
+            mutate_bot(bid, desired_running=False)
+            stop_process(bid)
+            bot.send_message(m.chat.id, "⏹ Stopped.", reply_markup=kb_actions(uid))
+        else:
+            # 🆕 PATCH 1d: Reset crash loop on manual start
+            mutate_bot(bid, failed_state=False, failed_reason="", recent_crashes=[])
+            status_msg = bot.send_message(m.chat.id, "🚀 Starting (installing deps)...",
+                                          reply_markup=kb_actions(uid))
+
+            def _bg_start():
+                try:
+                    ok, msg = start_process(bid)
+                    try:
+                        bot.edit_message_text(
+                            ("✅ " if ok else "❌ ") + esc(msg),
+                            chat_id=status_msg.chat.id,
+                            message_id=status_msg.message_id,
+                            reply_markup=kb_actions(uid),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        bot.edit_message_text(
+                            f"❌ {esc(exc)}",
+                            chat_id=status_msg.chat.id,
+                            message_id=status_msg.message_id,
+                        )
+                    except Exception:
+                        pass
+            threading.Thread(target=_bg_start, daemon=True).start()
+        return True
+
+    if text == "🔄 Restart":
+        status_msg = bot.send_message(m.chat.id, "🔄 Restarting...", reply_markup=kb_actions(uid))
+        def _bg_restart():
+            try:
+                ok, msg = restart_process(bid)
+                try:
+                    bot.edit_message_text(
+                        ("✅ " if ok else "❌ ") + esc(msg),
+                        chat_id=status_msg.chat.id,
+                        message_id=status_msg.message_id,
+                        reply_markup=kb_actions(uid),
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    bot.edit_message_text(f"❌ {esc(exc)}",
+                                          chat_id=status_msg.chat.id,
+                                          message_id=status_msg.message_id)
+                except Exception:
+                    pass
+        threading.Thread(target=_bg_restart, daemon=True).start()
+        return True
+
+    if text == "📊 Status":
+        bot.send_message(m.chat.id, bot_status(bid), reply_markup=kb_actions(uid))
+        return True
+
+    # 🆕 PATCH 5a: Log download
+    if text == "📜 Logs":
+        log_content = tail_logs(bid, lines=5000)
+        send_pre_chunks(m.chat.id, "Logs", log_content[-10000:], reply_markup=kb_actions(uid))
+        try:
+            full_log = tail_logs(bid, lines=50000)
+            buf = io.BytesIO(full_log.encode("utf-8"))
+            buf.name = f"{bid}_logs.txt"
+            b_obj = get_bot(bid)
+            bot.send_document(
+                m.chat.id, buf,
+                caption=f"📄 Full log ({len(full_log.splitlines())} lines)",
+                visible_file_name=f"{safe_name(b_obj['name'] if b_obj else bid)}_logs.txt",
+            )
+        except Exception:
+            pass
+        return True
+
+    # 🆕 PATCH 6b: Live log streaming
+    if text == "🔴 Live":
+        if bid in LIVE_LOGS_ACTIVE:
+            bot.send_message(m.chat.id, "Already streaming. Press any button to stop.",
+                             reply_markup=kb_actions(uid))
+            return True
+        LIVE_LOGS_ACTIVE[bid] = m.chat.id
+        stop_flag = threading.Event()
+        LIVE_LOGS_STOP[bid] = stop_flag
+        msg = bot.send_message(m.chat.id, "🔴 <b>Live streaming...</b>\n<i>Tap any button to stop</i>",
+                                parse_mode="HTML", reply_markup=kb_actions(uid))
+        last_size = [0]
+        def _stream():
+            try:
+                p = _log_path(bid)
+                if p.exists():
+                    last_size[0] = p.stat().st_size
+                while not stop_flag.is_set():
+                    time.sleep(2.0)
+                    if not p.exists():
+                        continue
+                    cur_size = p.stat().st_size
+                    if cur_size <= last_size[0]:
+                        continue
+                    with p.open("rb") as fh:
+                        fh.seek(last_size[0])
+                        new_data = fh.read(cur_size - last_size[0])
+                    last_size[0] = cur_size
+                    new_text = new_data.decode("utf-8", "replace")[-2000:]
+                    if not new_text.strip():
+                        continue
+                    try:
+                        bot.edit_message_text(
+                            f"🔴 <b>Live: {esc(b['name'])}</b>\n<pre>{esc(new_text)}</pre>",
+                            chat_id=msg.chat.id, message_id=msg.message_id,
+                            parse_mode="HTML", reply_markup=kb_actions(uid),
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                LIVE_LOGS_ACTIVE.pop(bid, None)
+                LIVE_LOGS_STOP.pop(bid, None)
+        threading.Thread(target=_stream, daemon=True).start()
+        return True
+
+    if text == "📁 Files":
+        show_files(m.chat.id, uid, bid)
+        return True
+
+    if text == "🔐 Env Vars":
+        show_env(m.chat.id, uid, bid)
+        return True
+
+    if text == "📦 Pip":
+        set_state(uid, "pip_install", bid)
+        bot.send_message(m.chat.id,
+            "Send packages separated by spaces (e.g. <code>requests python-dotenv</code>)\n\n"
+            "Or send:\n<code>requirements</code> → install requirements.txt\n"
+            "<code>auto</code> → scan imports and install missing",
+            reply_markup=kb_actions(uid))
+        return True
+
+    if text == "🌐 Tunnel":
+        set_state(uid, "tunnel_port", bid)
+        bot.send_message(m.chat.id,
+            "Send local port for Cloudflare quick tunnel (requires cloudflared).",
+            reply_markup=kb_actions(uid))
+        return True
+
+    if text == "⛔ Stop Tunnel":
+        with _proc_lock:
+            tunnel = RUNNING.get(bid, {}).get("tunnel")
+        if tunnel and tunnel.poll() is None:
+            try:
+                if os.name == "nt":
+                    tunnel.terminate()
+                else:
+                    os.killpg(tunnel.pid, signal.SIGTERM)
+                with _proc_lock:
+                    if bid in RUNNING:
+                        RUNNING[bid]["tunnel"] = None
+                bot.send_message(m.chat.id, "⛔ Tunnel stopped.", reply_markup=kb_actions(uid))
+            except Exception as exc:
+                bot.send_message(m.chat.id, "Stop failed: " + esc(exc),
+                                 reply_markup=kb_actions(uid))
+        else:
+            bot.send_message(m.chat.id, "No tunnel running.", reply_markup=kb_actions(uid))
+        return True
+
+    if text == "🗃 Backup":
+        MENU_LEVEL[uid] = "backup"
+        bot.send_message(m.chat.id, "Backup menu", reply_markup=kb_backup())
+        return True
+
+    if text == "✏️ Edit":
+        MENU_LEVEL[uid] = "edit"
+        bot.send_message(m.chat.id, "Edit menu", reply_markup=kb_edit())
+        return True
+
+    if text == "📋 Clone Bot":
+        try:
+            new_rec = clone_bot(uid, bid)
+            if new_rec:
+                bot.send_message(m.chat.id,
+                    f"📋 Cloned as <b>{esc(new_rec['name'])}</b>\nID: <code>{new_rec['id']}</code>",
+                    reply_markup=kb_actions(uid))
+            else:
+                bot.send_message(m.chat.id, "Clone failed.", reply_markup=kb_actions(uid))
+        except Exception as exc:
+            bot.send_message(m.chat.id, "Clone failed: " + esc(exc),
+                             reply_markup=kb_actions(uid))
+        return True
+
+    if text == "🗑 Delete Bot":
+        MENU_LEVEL[uid] = "delete_confirm"
+        bot.send_message(m.chat.id,
+            f"Delete <b>{esc(b['name'])}</b> and all files?\n\nTap 🔴 YES DELETE to confirm.",
+            reply_markup=kb_delete_confirm())
+        return True
+
+    return False
+
+
+# ── Menu button router ───────────────────────────────────────────────────
+def _handle_menu_button(m: types.Message, uid: int, text: str) -> bool:
+    level = MENU_LEVEL.get(uid, "main")
+
+    # 🆕 PATCH 6d: Stop live logs on any button press
+    bid_sel = SELECTED_BOT.get(uid)
+    if bid_sel and bid_sel in LIVE_LOGS_STOP:
+        LIVE_LOGS_STOP[bid_sel].set()
+        LIVE_LOGS_ACTIVE.pop(bid_sel, None)
+
+    if text == "📦 My Bots":
+        show_bots(m.chat.id, uid); return True
+    if text == "➕ Upload Bot":
+        set_state(uid, "upload_new")
+        bot.send_message(m.chat.id,
+            f"📤 Just send me your <code>.py</code>, <code>.js</code>, or <code>.zip</code> file directly.\n"
+            f"Bot will be created and started automatically!\n\n"
+            f"Max size: {_MAX_MB} MB",
+            parse_mode="HTML",
+            reply_markup=kb_main())
+        MENU_LEVEL[uid] = "main"
+        return True
+    if text == "🐙 GitHub Host":
+        set_state(uid, "github_url")
+        bot.send_message(m.chat.id,
+            "Send GitHub repo URL.\nPublic: <code>https://github.com/user/repo</code>\n\n"
+            "For private repos send /token first to set token.",
+            reply_markup=kb_main())
+        MENU_LEVEL[uid] = "main"
+        return True
+    if text == "📊 Dashboard":
+        show_dashboard(m.chat.id, uid); return True
+    if text == "❔ Help":
+        cmd_help(m); return True
+    if text == "⬅️ Main Menu":
+        _reset_menus(uid)
+        MENU_LEVEL[uid] = "main"
+        bot.send_message(m.chat.id, "Main menu.", reply_markup=kb_main()); return True
+    if text == "⬅️ My Bots":
+        show_bots(m.chat.id, uid); return True
+    if text == "⬅️ Bot Menu":
+        bid = SELECTED_BOT.get(uid)
+        if bid:
+            show_bot_card(m.chat.id, uid, bid)
+        else:
+            show_bots(m.chat.id, uid)
+        return True
+    if text == "⬅️ Cancel":
+        bid = SELECTED_BOT.get(uid)
+        if bid:
+            show_bot_card(m.chat.id, uid, bid)
+        else:
+            send_home(m.chat.id, uid)
+        return True
+
+    if level == "bots":
+        mm = re.match(r"^(\d+)\.\s", text)
+        if mm:
+            try:
+                idx = int(mm.group(1)) - 1
+                bots = BOT_INDEX.get(uid, [])
+                if 0 <= idx < len(bots):
+                    show_bot_card(m.chat.id, uid, bots[idx])
+                    return True
+            except Exception:
+                pass
+
+    if level == "actions":
+        bid = SELECTED_BOT.get(uid)
+        if bid and _handle_bot_action(m, uid, text, bid):
+            return True
+
+    if level == "env":
+        bid = SELECTED_BOT.get(uid)
+        if not bid:
+            send_home(m.chat.id, uid); return True
+        if text == "👁 Show Vars":
+            show_env(m.chat.id, uid, bid); return True
+        if text == "➕ Set Variable":
+            set_state(uid, "env_set", bid)
+            bot.send_message(m.chat.id, "Send <code>KEY=VALUE</code>", reply_markup=kb_env())
+            return True
+        if text == "📥 Bulk Import":
+            set_state(uid, "env_bulk", bid)
+            bot.send_message(m.chat.id,
+                "Send multiple lines, one per var:\n<code>KEY1=val1\nKEY2=val2</code>",
+                reply_markup=kb_env())
+            return True
+        if text == "➖ Delete Variable":
+            set_state(uid, "env_delete", bid)
+            bot.send_message(m.chat.id, "Send variable name to delete.",
+                             reply_markup=kb_env())
+            return True
+
+    if level == "backup":
+        bid = SELECTED_BOT.get(uid)
+        if not bid:
+            send_home(m.chat.id, uid); return True
+        if text == "⬇️ Download Backup":
+            try:
+                b = get_bot(bid)
+                raw = make_backup(bid)
+                buf = io.BytesIO(raw)
+                buf.name = f"{safe_name(b['name'])}-{bid}.zip"
+                bot.send_document(m.chat.id, buf,
+                    caption="Full backup (source + bot_meta.json).",
+                    reply_markup=kb_backup())
+            except Exception as exc:
+                bot.send_message(m.chat.id, "Failed: " + esc(exc),
+                                 reply_markup=kb_backup())
+            return True
+        if text == "♻️ Restore Backup":
+            set_state(uid, "restore_zip", bid)
+            bot.send_message(m.chat.id, "Send a ZIP backup. Source files will be replaced.",
+                             reply_markup=kb_backup())
+            return True
+
+    if level == "edit":
+        bid = SELECTED_BOT.get(uid)
+        if not bid:
+            send_home(m.chat.id, uid); return True
+        if text == "✏️ Rename":
+            set_state(uid, "rename", bid)
+            bot.send_message(m.chat.id, "Send new name (max 200 chars).",
+                             reply_markup=kb_edit())
+            return True
+        if text == "🎯 Set Entry":
+            root = project_dir(bid)
+            cands = [p.relative_to(root).as_posix() for p in project_files(bid)
+                     if p.suffix.lower() in {".py", ".js", ".mjs", ".cjs"}]
+            set_state(uid, "entry_set", bid)
+            hint = "\n".join(f"• <code>{esc(c)}</code>" for c in cands[:20]) or "(none)"
+            bot.send_message(m.chat.id,
+                f"Send path to entry file:\n{hint}", reply_markup=kb_edit())
+            return True
+        if text == "⏰ Daily Restart":
+            b = get_bot(bid)
+            current = (b.get("daily_restart") or "").strip() or "(disabled)"
+            bot.send_message(
+                m.chat.id,
+                f"<b>⏰ Daily Auto-Restart</b>\n\n"
+                f"Current: <code>{esc(current)}</code>\n\n"
+                f"Send time in <b>HH:MM</b> (UTC), e.g. <code>04:30</code>\n"
+                f"Or send <code>off</code> to disable.\n\n"
+                f"<i>Tip: 4:30 AM UTC = low traffic, best for restarts.</i>",
+                parse_mode="HTML",
+                reply_markup=kb_edit(),
+            )
+            set_state(uid, "daily_restart_set", bid)
+            return True
+
+    if level == "files":
+        bid = SELECTED_BOT.get(uid)
+        if not bid:
+            send_home(m.chat.id, uid); return True
+        if text == "📋 List Files":
+            show_files(m.chat.id, uid, bid); return True
+        if text == "➕ Upload File":
+            set_state(uid, "upload_file", bid)
+            bot.send_message(m.chat.id, "Send a file to add/replace.",
+                             reply_markup=kb_files())
+            return True
+        if text == "⬇️ Download File":
+            set_state(uid, "file_download", bid)
+            bot.send_message(m.chat.id, "Send relative path to download.",
+                             reply_markup=kb_files())
+            return True
+        if text == "⬇️ Download Project":
+            try:
+                b = get_bot(bid)
+                raw = make_backup(bid)
+                buf = io.BytesIO(raw)
+                buf.name = f"{safe_name(b['name'])}-{bid}.zip"
+                bot.send_document(m.chat.id, buf,
+                    caption="Full project backup.",
+                    reply_markup=kb_files())
+            except Exception as exc:
+                bot.send_message(m.chat.id, "Failed: " + esc(exc),
+                                 reply_markup=kb_files())
+            return True
+        if text == "🗑 Delete File":
+            set_state(uid, "file_delete", bid)
+            bot.send_message(m.chat.id, "Send relative path to delete.",
+                             reply_markup=kb_files())
+            return True
+
+    if level == "delete_confirm":
+        bid = SELECTED_BOT.get(uid)
+        if not bid:
+            send_home(m.chat.id, uid); return True
+        if text == "🔴 YES DELETE":
+            stop_process(bid)
+            d = db_load()
+            d["bots"].pop(bid, None)
+            db_save(d)
+            shutil.rmtree(project_dir(bid), ignore_errors=True)
+            SELECTED_BOT.pop(uid, None)
+            MENU_LEVEL[uid] = "main"
+            bot.send_message(m.chat.id, "🗑 Deleted.", reply_markup=kb_main())
+            return True
+
+    return False
+
+
+# ── Text handler (buttons + state flows) ─────────────────────────────────
 @bot.message_handler(content_types=["text"])
 def on_text(m: types.Message) -> None:
     uid = m.from_user.id
+    text = (m.text or "").strip()
+    if not text:
+        return
+
+    if _handle_menu_button(m, uid, text):
+        return
+
     st = STATES.get(uid)
     if not st:
         return
     flow = st.get("flow")
-    value = (m.text or "").strip()
-    if value == "/cancel":
-        STATES.pop(uid, None); bot.reply_to(m, "Cancelled."); return
     bid = st.get("bot_id")
     b = owned_bot(uid, bid) if bid else None
+
+    if flow in {"upload_new", "upload_file", "restore_zip"}:
+        bot.reply_to(m, "Please send the file, or /cancel.",
+                     reply_markup=current_kb(uid))
+        return
+
     try:
         if flow == "github_url":
             if len(user_bots(uid)) >= MAX_BOTS_PER_USER:
@@ -1243,7 +1973,7 @@ def on_text(m: types.Message) -> None:
             token = get_user(uid).get("gh_token")
             tmp = Path(tempfile.mkdtemp(prefix="ghclone-", dir=str(PROJECTS_DIR)))
             try:
-                ok, msg = clone_public_github(value, tmp / "repo", token=token)
+                ok, msg = clone_public_github(text, tmp / "repo", token=token)
                 if not ok:
                     shutil.rmtree(root, ignore_errors=True)
                     d = db_load(); d["bots"].pop(rec["id"], None); db_save(d)
@@ -1263,17 +1993,21 @@ def on_text(m: types.Message) -> None:
                 shutil.rmtree(tmp, ignore_errors=True)
             STATES.pop(uid, None)
             bot.reply_to(m, "✅ Cloned.")
-            send_bot_card(m.chat.id, uid, rec["id"])
-        elif flow == "gh_token":
-            save_user(uid, gh_token=value)
+            show_bot_card(m.chat.id, uid, rec["id"])
+            return
+
+        if flow == "gh_token":
+            save_user(uid, gh_token=text)
             STATES.pop(uid, None)
-            bot.reply_to(m, "✅ Token saved.")
-        elif flow == "env_set":
+            bot.reply_to(m, "✅ Token saved.", reply_markup=current_kb(uid))
+            return
+
+        if flow == "env_set":
             if not b:
                 raise ValueError("Bot not found")
-            if "=" not in value:
+            if "=" not in text:
                 raise ValueError("Format: KEY=VALUE")
-            key, val = value.split("=", 1)
+            key, val = text.split("=", 1)
             key, val = key.strip(), val.strip()
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
                 raise ValueError("Invalid name")
@@ -1285,13 +2019,16 @@ def on_text(m: types.Message) -> None:
             envs[key] = val
             mutate_bot(bid, env_enc=encrypt_obj(envs))
             STATES.pop(uid, None)
-            bot.reply_to(m, f"✅ Saved <code>{esc(key)}</code> (encrypted).")
-        elif flow == "env_bulk":
+            bot.reply_to(m, f"✅ Saved <code>{esc(key)}</code> (encrypted).",
+                         reply_markup=kb_env())
+            return
+
+        if flow == "env_bulk":
             if not b:
                 raise ValueError("Bot not found")
             envs = decrypt_obj(b.get("env_enc", ""))
             added = 0
-            for line in value.splitlines():
+            for line in text.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
@@ -1305,19 +2042,23 @@ def on_text(m: types.Message) -> None:
                 added += 1
             mutate_bot(bid, env_enc=encrypt_obj(envs))
             STATES.pop(uid, None)
-            bot.reply_to(m, f"✅ Added/updated {added} variables.")
-        elif flow == "env_delete":
+            bot.reply_to(m, f"✅ Added/updated {added} variables.", reply_markup=kb_env())
+            return
+
+        if flow == "env_delete":
             if not b:
                 raise ValueError("Bot not found")
             envs = decrypt_obj(b.get("env_enc", ""))
-            envs.pop(value, None)
+            envs.pop(text, None)
             mutate_bot(bid, env_enc=encrypt_obj(envs))
             STATES.pop(uid, None)
-            bot.reply_to(m, "Deleted.")
-        elif flow == "pip_install":
+            bot.reply_to(m, "🗑 Deleted.", reply_markup=kb_env())
+            return
+
+        if flow == "pip_install":
             if not b:
                 raise ValueError("Bot not found")
-            low = value.lower()
+            low = text.lower()
             if low == "requirements":
                 ok, out = install_requirements(bid)
             elif low == "auto":
@@ -1327,18 +2068,21 @@ def on_text(m: types.Message) -> None:
                 miss = missing_imports(project_dir(bid), _venv_python(project_dir(bid)))
                 if not miss:
                     STATES.pop(uid, None)
-                    bot.reply_to(m, "✅ All imports OK.")
+                    bot.reply_to(m, "✅ All imports OK.", reply_markup=kb_actions(uid))
                     return
                 ok, out = install_requirements(bid, miss)
             else:
-                pkgs = value.split()
+                pkgs = text.split()
                 ok, out = install_requirements(bid, pkgs)
             STATES.pop(uid, None)
-            bot.reply_to(m, ("✅ " if ok else "❌ ") + "<pre>" + esc(out[-3800:]) + "</pre>")
-        elif flow == "tunnel_port":
+            bot.reply_to(m, ("✅ " if ok else "❌ ") + "<pre>" + esc(out[-3800:]) + "</pre>",
+                         reply_markup=kb_actions(uid))
+            return
+
+        if flow == "tunnel_port":
             if not b:
                 raise ValueError("Bot not found")
-            port = int(value)
+            port = int(text)
             if not 1 <= port <= 65535:
                 raise ValueError("Port 1–65535")
             cf = shutil.which("cloudflared")
@@ -1355,32 +2099,94 @@ def on_text(m: types.Message) -> None:
                         start_new_session=(os.name != "nt"))
                 RUNNING.setdefault(bid, {"proc": None, "started": time.time(), "tunnel": None})["tunnel"] = tunnel
             STATES.pop(uid, None)
-            bot.reply_to(m, "🌐 Tunnel started. Check logs for the public URL.")
-        elif flow == "file_delete":
+            bot.reply_to(m, "🌐 Tunnel started. Check logs for the public URL.",
+                         reply_markup=kb_actions(uid))
+            return
+
+        if flow == "daily_restart_set":
             if not b:
                 raise ValueError("Bot not found")
-            target = safe_project_path(project_dir(bid), value)
+            val = text.strip().lower()
+            if val in ("off", "disable", "none", ""):
+                mutate_bot(bid, daily_restart="", last_daily_restart=0)
+                STATES.pop(uid, None)
+                bot.reply_to(m, "✅ Daily restart disabled.",
+                             reply_markup=kb_edit())
+                return
+            mm = re.fullmatch(r"(\d{1,2}):(\d{2})", val)
+            if not mm:
+                raise ValueError("Format: HH:MM (e.g. 04:30) or 'off'")
+            hh, mn = int(mm.group(1)), int(mm.group(2))
+            if not (0 <= hh < 24 and 0 <= mn < 60):
+                raise ValueError("Invalid time (00:00 - 23:59)")
+            normalized = f"{hh:02d}:{mn:02d}"
+            mutate_bot(bid, daily_restart=normalized, last_daily_restart=0)
+            STATES.pop(uid, None)
+            bot.reply_to(
+                m,
+                f"✅ Daily restart set to <code>{normalized}</code> UTC\n"
+                f"Bot will auto-restart every day at this time.",
+                parse_mode="HTML",
+                reply_markup=kb_edit(),
+            )
+            return
+
+        if flow == "rename":
+            if not b:
+                raise ValueError("Bot not found")
+            if not text or len(text) > 200:
+                raise ValueError("Name 1–200 chars")
+            mutate_bot(bid, name=text)
+            STATES.pop(uid, None)
+            bot.reply_to(m, "✅ Renamed.", reply_markup=kb_edit())
+            return
+
+        if flow == "entry_set":
+            if not b:
+                raise ValueError("Bot not found")
+            root = project_dir(bid)
+            target = safe_project_path(root, text)
+            if not target.is_file() or target.suffix.lower() not in {".py", ".js", ".mjs", ".cjs"}:
+                raise ValueError("Invalid entry file")
+            mutate_bot(bid, entry=text)
+            STATES.pop(uid, None)
+            bot.reply_to(m, f"✅ Entry → <code>{esc(text)}</code>", reply_markup=kb_edit())
+            return
+
+        if flow == "file_delete":
+            if not b:
+                raise ValueError("Bot not found")
+            target = safe_project_path(project_dir(bid), text)
             if not target.is_file() or target.name == ".hosting.log":
                 raise ValueError("Not found or protected")
             target.unlink()
             STATES.pop(uid, None)
-            bot.reply_to(m, f"🗑 Deleted <code>{esc(value)}</code>")
-            send_bot_card(m.chat.id, uid, bid)
-        elif flow == "rename":
+            bot.reply_to(m, f"🗑 Deleted <code>{esc(text)}</code>", reply_markup=kb_files())
+            return
+
+        if flow == "file_download":
             if not b:
                 raise ValueError("Bot not found")
-            if not value or len(value) > 200:
-                raise ValueError("Name 1–200 chars")
-            mutate_bot(bid, name=value)
+            target = safe_project_path(project_dir(bid), text)
+            if not target.is_file():
+                raise ValueError("Not found")
+            if target.stat().st_size > 100 * 1024 * 1024:
+                raise ValueError("File too large (>100 MB). Use Download Project.")
+            with target.open("rb") as fh:
+                buf = io.BytesIO(fh.read())
+            buf.name = target.name
+            bot.send_document(m.chat.id, buf,
+                caption=f"<code>{esc(text)}</code>",
+                reply_markup=kb_files())
             STATES.pop(uid, None)
-            bot.reply_to(m, "✅ Renamed.")
-            send_bot_card(m.chat.id, uid, bid)
-        else:
-            STATES.pop(uid, None)
-    except Exception as exc:
-        bot.reply_to(m, "❌ " + esc(exc))
+            return
 
-# ── Monitor loop (crash recovery + resource limits) ─────────────────────
+        STATES.pop(uid, None)
+    except Exception as exc:
+        bot.reply_to(m, "❌ " + esc(exc), reply_markup=current_kb(uid))
+
+
+# ── Monitor loop ─────────────────────────────────────────────────────────
 def monitor_loop() -> None:
     while True:
         try:
@@ -1392,7 +2198,6 @@ def monitor_loop() -> None:
                 proc = state.get("proc") if state else None
                 alive = bool(proc and proc.poll() is None)
 
-                # Resource limits (only if set)
                 if alive and psutil and state and state.get("proc"):
                     try:
                         p = psutil.Process(state["proc"].pid)
@@ -1407,7 +2212,26 @@ def monitor_loop() -> None:
                     except Exception:
                         pass
 
-                # Periodic restart
+                    # 🆕 PATCH 4c: Disk quota check (every ~60s)
+                    if int(now) % 60 == 0 and MAX_BOT_DISK_MB:
+                        disk_mb = _bot_disk_usage_mb(bid)
+                        if disk_mb > MAX_BOT_DISK_MB:
+                            write_log(bid, f"Disk overuse ({disk_mb:.0f}MB > {MAX_BOT_DISK_MB}MB) — killing")
+                            mutate_bot(bid, resource_killed=True,
+                                       failed_reason=f"Disk quota: {disk_mb:.0f}MB")
+                            stop_process(bid)
+                            try:
+                                bot.send_message(
+                                    int(b.get("owner", 0)),
+                                    f"💾 <b>Disk quota exceeded</b>\n\n"
+                                    f"Bot: <b>{esc(b['name'])}</b>\n"
+                                    f"Usage: {disk_mb:.0f} MB / {MAX_BOT_DISK_MB} MB\n\nBot stopped.",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                            continue
+
                 if alive and int(b.get("restart_interval", 0)) > 0:
                     last = int(b.get("last_interval_restart", int(now)))
                     if now - last >= int(b["restart_interval"]):
@@ -1417,7 +2241,20 @@ def monitor_loop() -> None:
                         start_process(bid, manual=False)
                         continue
 
-                # Detect exit
+                daily = (b.get("daily_restart") or "").strip()
+                if alive and daily:
+                    try:
+                        gm = time.gmtime(now)
+                        current_hm = f"{gm.tm_hour:02d}:{gm.tm_min:02d}"
+                        last_daily = int(b.get("last_daily_restart", 0))
+                        if current_hm == daily and (now - last_daily) > 3600:
+                            write_log(bid, f"Daily restart triggered at {daily} UTC")
+                            restart_process(bid)
+                            mutate_bot(bid, last_daily_restart=int(now))
+                            continue
+                    except Exception:
+                        pass
+
                 if state and proc and not alive:
                     code = proc.returncode
                     with _proc_lock:
@@ -1426,12 +2263,37 @@ def monitor_loop() -> None:
                             RUNNING[bid] = {"proc": None, "started": now, "tunnel": tunnel}
                         else:
                             RUNNING.pop(bid, None)
-                    mutate_bot(bid, last_exit=code)
+                    # 🆕 PATCH 1c: Track crash timestamp
+                    recent = list(b.get("recent_crashes") or [])
+                    recent.append(now)
+                    recent = recent[-10:]
+                    mutate_bot(bid, last_exit=code, recent_crashes=recent)
                     write_log(bid, f"Exited code {code}")
+                    _send_crash_notification(bid, code)
                     b = get_bot(bid) or b
 
-                # Crash recovery (with backoff)
+                # 🆕 PATCH 1b: Crash loop breaker
                 if not alive and b.get("desired_running") and b.get("auto_restart", True):
+                    if b.get("failed_state"):
+                        continue
+                    crashes = [t for t in (b.get("recent_crashes") or []) if now - t < 600]
+                    if len(crashes) >= 5:
+                        mutate_bot(bid, failed_state=True,
+                                   failed_reason=f"Crash loop: {len(crashes)} crashes in 10 min")
+                        write_log(bid, "CRASH LOOP — auto-restart disabled")
+                        try:
+                            bot.send_message(
+                                int(b.get("owner", 0)),
+                                f"🔴 <b>Bot crashed {len(crashes)} times in 10 min</b>\n\n"
+                                f"Bot: <b>{esc(b['name'])}</b>\n"
+                                f"Auto-restart <b>DISABLED</b>.\n\n"
+                                f"Fix: check 📜 Logs → fix code → press 🟢 Start",
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            pass
+                        continue
+
                     if bid not in RETRY_AT:
                         count = int(b.get("restart_count", 0)) + 1
                         mutate_bot(bid, restart_count=count)
@@ -1449,6 +2311,7 @@ def monitor_loop() -> None:
         except Exception as exc:
             print("monitor:", exc, flush=True)
         time.sleep(RESOURCE_CHECK_INTERVAL)
+
 
 # ── Health server ─────────────────────────────────────────────────────────
 def start_health_server() -> None:
@@ -1483,11 +2346,15 @@ def shutdown() -> None:
 
 def main() -> None:
     threading.Thread(target=monitor_loop, daemon=True, name="process-monitor").start()
+    # 🆕 PATCH 7c: Start auto-backup thread
+    threading.Thread(target=_auto_backup_loop, daemon=True, name="auto-backup").start()
     start_health_server()
     for bid, b in db_load().get("bots", {}).items():
         if b.get("desired_running"):
             threading.Thread(target=lambda x=bid: start_process(x, manual=False), daemon=True).start()
-    print("[hosting] panel started (powerful build — UNLIMITED)", flush=True)
+    print("[hosting] panel started (enhanced + 7 patches)", flush=True)
+    if BACKUP_CHANNEL:
+        print(f"[hosting] auto-backup enabled → {BACKUP_CHANNEL}", flush=True)
     try:
         try:
             bot.remove_webhook()
@@ -1500,6 +2367,8 @@ def main() -> None:
                 types.BotCommand("help", "Help"),
                 types.BotCommand("cancel", "Cancel input"),
                 types.BotCommand("id", "Show my user ID"),
+                types.BotCommand("token", "Set GitHub token"),
+                types.BotCommand("grep", "Search bot logs"),
             ])
         except Exception:
             pass
